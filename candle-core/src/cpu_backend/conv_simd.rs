@@ -25,7 +25,7 @@ impl Map2 for Conv2D<'_> {
         // Output shape: [b_size, c_out, out_h, out_w].
         let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
 
-        let start = std::time::Instant::now();
+        // let start = std::time::Instant::now();
         let cont_s0 = p.i_h * p.i_w * p.c_in;
         let cont_s1 = p.i_w * p.c_in;
         let cont_s2 = p.c_in;
@@ -49,9 +49,9 @@ impl Map2 for Conv2D<'_> {
             }
             Cow::Owned(inp_cont)
         };
-        println!("- conv2d copy: {:?}", start.elapsed());
+        // println!("- conv2d copy: {:?}", start.elapsed());
 
-        let start = std::time::Instant::now();
+        // let start = std::time::Instant::now();
         let k_cache: Vec<Vec<T>> = (0..p.c_out)
             .map(|dst_c_idx| {
                 (0..p.k_h * p.k_w)
@@ -68,12 +68,12 @@ impl Map2 for Conv2D<'_> {
                     .collect()
             })
             .collect();
-        println!("- conv2d k_cache: {:?}", start.elapsed());
+        // println!("- conv2d k_cache: {:?}", start.elapsed());
 
         for offset_h in 0..p.k_h {
-            let start = std::time::Instant::now();
+            // let start = std::time::Instant::now();
             for offset_w in 0..p.k_w {
-                let start = std::time::Instant::now();
+                // let start = std::time::Instant::now();
                 let k_offset = offset_h * p.k_w + offset_w;
 
                 (0..p.c_out).into_par_iter().for_each(|dst_c_idx| {
@@ -101,12 +101,12 @@ impl Map2 for Conv2D<'_> {
                         }
                     }
                 });
-                println!(
-                    "--- {offset_h}:{offset_w} conv2d compute: {:?}",
-                    start.elapsed()
-                );
+                // println!(
+                // "--- {offset_h}:{offset_w} conv2d compute: {:?}",
+                // start.elapsed()
+                // );
             }
-            println!("-- {offset_h} conv2d compute: {:?}", start.elapsed());
+            // println!("-- {offset_h} conv2d compute: {:?}", start.elapsed());
         }
 
         Ok(dst)
