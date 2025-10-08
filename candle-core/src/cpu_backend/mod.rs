@@ -1,4 +1,6 @@
 //! Implementation of Backend Fns for CPU
+use std::borrow::Cow;
+
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{DType, Error, IntDType, Layout, Result, Shape, WithDType};
@@ -6,6 +8,7 @@ use float8::F8E4M3;
 use half::{bf16, f16};
 use rayon::prelude::*;
 
+mod conv_simd;
 mod utils;
 pub use utils::{
     binary_map, binary_map_vec, unary_map, unary_map_vec, Map1, Map1Any, Map2, Map2InPlace, Map2U8,
@@ -13,7 +16,8 @@ pub use utils::{
 
 const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
-const USE_IM2COL_CONV2D: bool = true;
+// const USE_IM2COL_CONV2D: bool = true;
+const USE_IM2COL_CONV2D: bool = false;
 
 // TODO: Maybe we should not implement [Clone] here and instead have an explicit allocator +
 // intercept the oom errors to avoid panicking and provide a proper error.
@@ -769,6 +773,13 @@ fn copy_strided_src_<T: Copy>(src: &[T], dst: &mut [T], dst_offset: usize, src_l
             block_start_index,
             block_len: 1,
         } => {
+            // let max_elements = dst.len().saturating_sub(dst_offset);
+            // let iter = block_start_index.take(max_elements).enumerate();
+            // for (dst_index, src_index) in iter {
+            //     let dst_index = dst_index + dst_offset;
+            //     dst[dst_index] = src[src_index]
+            // }
+
             for (dst_index, src_index) in block_start_index.enumerate() {
                 let dst_index = dst_index + dst_offset;
                 if dst_index >= dst.len() {
@@ -794,6 +805,48 @@ fn copy_strided_src_<T: Copy>(src: &[T], dst: &mut [T], dst_offset: usize, src_l
             }
         }
     }
+}
+
+#[ignore]
+#[test]
+fn test_strided_src_speed() {
+    use rand::Rng;
+    use std::hint::black_box;
+    use std::time::Duration;
+
+    let mut rng = rand::rng();
+    // Params taken from a 3x3 conv2d on a 320x320 image with bsz of 2.
+    // const LEN: usize = 3_276_800;
+    const LEN: usize = 10_000_000;
+    let mut src = vec![1f32; LEN];
+    let mut dst = vec![0f32; LEN];
+    let dst_offset = 0usize;
+    let layout = Layout::new(
+        Shape::from((2, 16, 320, 320)),
+        vec![LEN / 2, 1, 5120, 16],
+        0,
+    );
+    let mut total = Duration::ZERO;
+    const ITERS: usize = 1000;
+    // 10 iters warmup.
+    for i in 0..ITERS + 10 {
+        // Fill src with random values every time.
+        src.iter_mut()
+            .for_each(|x| *x = rng.random_range(-100f32..=100f32));
+        let start = std::time::Instant::now();
+        black_box(copy_strided_src_(&src, &mut dst, dst_offset, &layout));
+        let elapsed = start.elapsed();
+        // Clear vec after copy every time.
+        black_box(dst.fill(0f32));
+        // Skip the first 10 iters for warmup.
+        if i > 10 {
+            total += elapsed;
+        }
+    }
+    println!(
+        "Average time over {ITERS} iters: {:?}",
+        total / ITERS as u32
+    );
 }
 
 struct Conv1D<'a>(&'a crate::conv::ParamsConv1D);
@@ -942,6 +995,20 @@ impl Map1 for Im2Col {
             dilation,
             padding,
         } = self;
+        // vs.len: 614400
+        // Layout: Layout { shape: [2, 3, 320, 320], stride: [307200, 102400, 320, 1], start_offset: 0 }
+        // h_k: 3
+        // w_k: 3
+        // stride: 1
+        // dilation: 1
+        // padding: 1
+        // h_out: 320
+        // w_out: 320
+        // src_s0: 307200
+        // src_s1: 102400
+        // src_s2: 320
+        // src_s3: 1
+        // dst.len: 5529600
         let (b, c, h, w) = layout.shape().dims4()?;
         let (h_out, w_out) = self.hw_out(h, w);
         let src = &vs[layout.start_offset()..];
@@ -990,6 +1057,70 @@ impl Map1 for Im2Col {
         }
         Ok(dst)
     }
+}
+
+#[ignore]
+#[test]
+fn testerino_im2col() {
+    use rand::Rng;
+    use std::hint::black_box;
+    use std::time::Duration;
+
+    // vs.len: 614400
+    // Layout: Layout { shape: [2, 3, 320, 320], stride: [307200, 102400, 320, 1], start_offset: 0 }
+    // h_k: 3
+    // w_k: 3
+    // stride: 1
+    // dilation: 1
+    // padding: 1
+
+    let mut rng = rand::rng();
+    // Params taken from a 3x3 conv2d on a 320x320 image with bsz of 2.
+    // const LEN: usize = 3_276_800;
+    const LEN: usize = 614400;
+    let mut src = vec![1f32; LEN];
+    let layout = Layout::new(
+        Shape::from((2, 3, 320, 320)),
+        vec![LEN / 2, LEN / 6, 320, 1],
+        0,
+    );
+    let mut total = Duration::ZERO;
+    const ITERS: usize = 1000;
+    const WARMUP: usize = 100;
+    let mut min = Duration::MAX;
+    let mut max = Duration::ZERO;
+    for i in 0..ITERS + WARMUP {
+        // Fill src with random values every time.
+        src.iter_mut()
+            .for_each(|x| *x = rng.random_range(-100f32..=100f32));
+        let start = std::time::Instant::now();
+        let im2col = Im2Col {
+            h_k: 3,
+            w_k: 3,
+            stride: 1,
+            dilation: 1,
+            padding: 1,
+        };
+        let _res = black_box(im2col.f(&src, &layout)).unwrap();
+        let elapsed = start.elapsed();
+        // println!("elapsed: {elapsed:?}");
+        // Skip the first 10 iters for warmup.
+        if i > WARMUP {
+            total += elapsed;
+            if elapsed < min {
+                min = elapsed
+            }
+            if elapsed > max {
+                max = elapsed
+            }
+        }
+    }
+    println!("Min time over {ITERS} iters: {min:?}");
+    println!("Max time over {ITERS} iters: {max:?}");
+    println!(
+        "Average time over {ITERS} iters: {:?}",
+        total / ITERS as u32
+    );
 }
 
 struct Col2Im1D {
@@ -1089,93 +1220,365 @@ impl Map2 for ConvTranspose1D<'_> {
     }
 }
 
-struct Conv2D<'a>(&'a crate::conv::ParamsConv2D);
+use conv_simd::Conv2D;
+// struct Conv2D<'a>(&'a crate::conv::ParamsConv2D);
 
-impl Map2 for Conv2D<'_> {
-    const OP: &'static str = "conv2d";
-    fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
-        let p = self.0;
-        let inp = &inp[inp_l.start_offset()..];
-        let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
-        let k = &k[k_l.start_offset()..];
-        let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
-        let (out_h, out_w) = (p.out_h(), p.out_w());
+// impl Map2 for Conv2D<'_> {
+//     const OP: &'static str = "conv2d";
+//     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
+//         let p = self.0;
+//         let inp = &inp[inp_l.start_offset()..];
+//         let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
+//         let k = &k[k_l.start_offset()..];
+//         let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
+//         let (out_h, out_w) = (p.out_h(), p.out_w());
 
-        // Output shape: [b_size, c_out, out_h, out_w].
-        let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
+//         // Output shape: [b_size, c_out, out_h, out_w].
+//         let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
 
-        // TODO: Avoid making this copy if `inp` already has the appropriate layout.
-        let mut inp_cont = vec![T::zero(); p.b_size * p.c_in * p.i_h * p.i_w];
-        let cont_s0 = p.i_h * p.i_w * p.c_in;
-        let cont_s1 = p.i_w * p.c_in;
-        let cont_s2 = p.c_in;
-        for b_idx in 0..p.b_size {
-            for h_idx in 0..p.i_h {
-                for w_idx in 0..p.i_w {
-                    for c_idx in 0..p.c_in {
-                        let src_idx =
-                            b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
-                        let dst_idx = b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
-                        inp_cont[dst_idx] = inp[src_idx]
-                    }
-                }
-            }
-        }
+//         let start = std::time::Instant::now();
+//         let cont_s0 = p.i_h * p.i_w * p.c_in;
+//         let cont_s1 = p.i_w * p.c_in;
+//         let cont_s2 = p.c_in;
+//         let layout_is_valid = inp_l.stride() == [cont_s0, cont_s1, cont_s2, 1];
+//         let inp_cont: Cow<[T]> = if layout_is_valid {
+//             Cow::Borrowed(inp)
+//         } else {
+//             let mut inp_cont = vec![T::zero(); p.b_size * p.c_in * p.i_h * p.i_w];
+//             for b_idx in 0..p.b_size {
+//                 for h_idx in 0..p.i_h {
+//                     for w_idx in 0..p.i_w {
+//                         for c_idx in 0..p.c_in {
+//                             let src_idx =
+//                                 b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
+//                             let dst_idx =
+//                                 b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
+//                             inp_cont[dst_idx] = inp[src_idx]
+//                         }
+//                     }
+//                 }
+//             }
+//             Cow::Owned(inp_cont)
+//         };
+//         // TODO: Avoid making this copy if `inp` already has the appropriate layout.
+//         // let mut inp_cont = vec![T::zero(); p.b_size * p.c_in * p.i_h * p.i_w];
+//         // let cont_s0 = p.i_h * p.i_w * p.c_in;
+//         // let cont_s1 = p.i_w * p.c_in;
+//         // let cont_s2 = p.c_in;
+//         // for b_idx in 0..p.b_size {
+//         //     for h_idx in 0..p.i_h {
+//         //         for w_idx in 0..p.i_w {
+//         //             for c_idx in 0..p.c_in {
+//         //                 let src_idx =
+//         //                     b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
+//         //                 let dst_idx = b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
+//         //                 inp_cont[dst_idx] = inp[src_idx]
+//         //             }
+//         //         }
+//         //     }
+//         // }
+//         println!("- conv2d copy: {:?}", start.elapsed());
+//         let start = std::time::Instant::now();
+//         let k_cache: Vec<Vec<T>> = (0..p.c_out)
+//             .map(|dst_c_idx| {
+//                 (0..p.k_h * p.k_w)
+//                     .flat_map(|kw_kh| {
+//                         let offset_h = kw_kh / p.k_w;
+//                         let offset_w = kw_kh % p.k_w;
+//                         (0..p.c_in).map(move |c_in_idx| {
+//                             k[dst_c_idx * k_s0
+//                                 + c_in_idx * k_s1
+//                                 + offset_h * k_s2
+//                                 + offset_w * k_s3]
+//                         })
+//                     })
+//                     .collect()
+//             })
+//             .collect();
+//         println!("- conv2d k_cache: {:?}", start.elapsed());
 
-        for offset_h in 0..p.k_h {
-            for offset_w in 0..p.k_w {
-                (0..p.c_out).into_par_iter().for_each(|dst_c_idx| {
-                    let dst_idx = dst_c_idx * out_w * out_h;
-                    let k_cont = (0..p.c_in)
-                        .map(|c_in_idx| {
-                            k[dst_c_idx * k_s0
-                                + c_in_idx * k_s1
-                                + offset_h * k_s2
-                                + offset_w * k_s3]
-                        })
-                        .collect::<Vec<_>>();
-                    for b_idx in 0..p.b_size {
-                        let dst_idx = dst_idx + b_idx * p.c_out * out_h * out_w;
-                        for dst_h in 0..out_h {
-                            let dst_idx = dst_idx + dst_h * out_w;
-                            let src_h = p.stride * dst_h + offset_h * p.dilation;
-                            if src_h < p.padding || src_h >= p.i_h + p.padding {
-                                continue;
-                            }
-                            let src_h = src_h - p.padding;
-                            for dst_w in 0..out_w {
-                                let dst_idx = dst_idx + dst_w;
-                                let src_w = p.stride * dst_w + offset_w * p.dilation;
-                                if src_w < p.padding || src_w >= p.i_w + p.padding {
-                                    continue;
-                                }
-                                let src_w = src_w - p.padding;
-                                let inp_cont = &inp_cont
-                                    [b_idx * cont_s0 + src_h * cont_s1 + src_w * cont_s2..];
-                                assert!(inp_cont.len() >= p.c_in);
-                                assert!(k_cont.len() >= p.c_in);
-                                let mut d = T::zero();
-                                unsafe {
-                                    T::vec_dot(inp_cont.as_ptr(), k_cont.as_ptr(), &mut d, p.c_in)
-                                }
-                                let dst_p = dst.as_ptr();
-                                // Safety: dst_idx are uniques per dst_c_idx which is used to parallelise
-                                // the different tasks so no two threads can try to write at the same
-                                // location.
-                                unsafe {
-                                    let ptr = dst_p.add(dst_idx) as *mut T;
-                                    *ptr += d
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        }
+//         for offset_h in 0..p.k_h {
+//             let start = std::time::Instant::now();
+//             for offset_w in 0..p.k_w {
+//                 let start = std::time::Instant::now();
+//                 let k_offset = offset_h * p.k_w + offset_w;
 
-        Ok(dst)
-    }
-}
+//                 (0..p.c_out).into_par_iter().for_each(|dst_c_idx| {
+//                     let k_cont = &k_cache[dst_c_idx][k_offset * p.c_in..(k_offset + 1) * p.c_in];
+//                     let base_dst_idx = dst_c_idx * out_w * out_h;
+
+//                     for b_idx in 0..p.b_size {
+//                         let batch_dst_idx = base_dst_idx + b_idx * p.c_out * out_h * out_w;
+//                         let batch_src_idx = b_idx * cont_s0;
+
+//                         for dst_h in 0..out_h {
+//                             let src_h = p.stride * dst_h + offset_h * p.dilation;
+//                             if src_h < p.padding || src_h >= p.i_h + p.padding {
+//                                 continue;
+//                             }
+//                             let src_h = src_h - p.padding;
+//                             let h_dst_idx = batch_dst_idx + dst_h * out_w;
+//                             let h_src_idx = batch_src_idx + src_h * cont_s1;
+
+//                             for dst_w in 0..out_w {
+//                                 let src_w = p.stride * dst_w + offset_w * p.dilation;
+//                                 if src_w < p.padding || src_w >= p.i_w + p.padding {
+//                                     continue;
+//                                 }
+//                                 let src_w = src_w - p.padding;
+//                                 let dst_idx = h_dst_idx + dst_w;
+//                                 let inp_cont = &inp_cont[h_src_idx + src_w * cont_s2..];
+
+//                                 let mut d = T::zero();
+//                                 unsafe {
+//                                     T::vec_dot(inp_cont.as_ptr(), k_cont.as_ptr(), &mut d, p.c_in)
+//                                 }
+
+//                                 unsafe {
+//                                     let ptr = dst.as_ptr().add(dst_idx) as *mut T;
+//                                     *ptr += d;
+//                                 }
+//                             }
+//                         }
+//                     }
+//                 });
+//                 println!(
+//                     "--- {offset_h}:{offset_w} conv2d compute: {:?}",
+//                     start.elapsed()
+//                 );
+//             }
+//             println!("-- {offset_h} conv2d compute: {:?}", start.elapsed());
+//         }
+
+//         // let start = std::time::Instant::now();
+//         // for offset_h in 0..p.k_h {
+//         //     let start = std::time::Instant::now();
+//         //     for offset_w in 0..p.k_w {
+//         //         let start = std::time::Instant::now();
+//         //         (0..p.c_out).into_par_iter().for_each(|dst_c_idx| {
+//         //             let dst_idx = dst_c_idx * out_w * out_h;
+//         //             // let start = std::time::Instant::now();
+//         //             let k_cont = (0..p.c_in)
+//         //                 .map(|c_in_idx| {
+//         //                     k[dst_c_idx * k_s0
+//         //                         + c_in_idx * k_s1
+//         //                         + offset_h * k_s2
+//         //                         + offset_w * k_s3]
+//         //                 })
+//         //                 .collect::<Vec<_>>();
+//         //             // println!(
+//         //             //     "---- {offset_h}:{offset_w} conv2d k_collect {dst_c_idx}: {:?}",
+//         //             //     start.elapsed()
+//         //             // );
+//         //             let start = std::time::Instant::now();
+//         //             for b_idx in 0..p.b_size {
+//         //                 let dst_idx = dst_idx + b_idx * p.c_out * out_h * out_w;
+//         //                 for dst_h in 0..out_h {
+//         //                     let dst_idx = dst_idx + dst_h * out_w;
+//         //                     let src_h = p.stride * dst_h + offset_h * p.dilation;
+//         //                     if src_h < p.padding || src_h >= p.i_h + p.padding {
+//         //                         continue;
+//         //                     }
+//         //                     let src_h = src_h - p.padding;
+//         //                     for dst_w in 0..out_w {
+//         //                         let dst_idx = dst_idx + dst_w;
+//         //                         let src_w = p.stride * dst_w + offset_w * p.dilation;
+//         //                         if src_w < p.padding || src_w >= p.i_w + p.padding {
+//         //                             continue;
+//         //                         }
+//         //                         let src_w = src_w - p.padding;
+//         //                         let inp_cont = &inp_cont
+//         //                             [b_idx * cont_s0 + src_h * cont_s1 + src_w * cont_s2..];
+//         //                         assert!(inp_cont.len() >= p.c_in);
+//         //                         assert!(k_cont.len() >= p.c_in);
+//         //                         let mut d = T::zero();
+//         //                         unsafe {
+//         //                             T::vec_dot(inp_cont.as_ptr(), k_cont.as_ptr(), &mut d, p.c_in)
+//         //                         }
+//         //                         let dst_p = dst.as_ptr();
+//         //                         // Safety: dst_idx are uniques per dst_c_idx which is used to parallelise
+//         //                         // the different tasks so no two threads can try to write at the same
+//         //                         // location.
+//         //                         unsafe {
+//         //                             let ptr = dst_p.add(dst_idx) as *mut T;
+//         //                             *ptr += d
+//         //                         }
+//         //                     }
+//         //                 }
+//         //             }
+//         //             println!(
+//         //                 "---- {offset_h}:{offset_w} conv2d compute c_out {dst_c_idx}: {:?}",
+//         //                 start.elapsed()
+//         //             );
+//         //         });
+//         //         println!(
+//         //             "--- {offset_h}:{offset_w} conv2d compute: {:?}",
+//         //             start.elapsed()
+//         //         );
+//         //     }
+//         //     println!("-- {offset_h} conv2d compute: {:?}", start.elapsed());
+//         // }
+//         // println!("- conv2d compute: {:?}", start.elapsed());
+
+//         Ok(dst)
+//     }
+// }
+
+// impl Map2 for Conv2D<'_> {
+//     const OP: &'static str = "conv2d";
+//     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
+//         let p = self.0;
+//         let inp = &inp[inp_l.start_offset()..];
+//         let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
+//         let k = &k[k_l.start_offset()..];
+//         let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
+//         let (out_h, out_w) = (p.out_h(), p.out_w());
+
+//         // Output shape: [b_size, c_out, out_h, out_w].
+//         let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
+
+//         let start = std::time::Instant::now();
+//         let cont_s0 = p.i_h * p.i_w * p.c_in;
+//         let cont_s1 = p.i_w * p.c_in;
+//         let cont_s2 = p.c_in;
+//         let layout_is_valid = inp_l.stride() == [cont_s0, cont_s1, cont_s2, 1];
+//         let inp_cont: Cow<[T]> = if layout_is_valid {
+//             Cow::Borrowed(inp)
+//         } else {
+//             let mut inp_cont = vec![T::zero(); p.b_size * p.c_in * p.i_h * p.i_w];
+//             for b_idx in 0..p.b_size {
+//                 for h_idx in 0..p.i_h {
+//                     for w_idx in 0..p.i_w {
+//                         for c_idx in 0..p.c_in {
+//                             let src_idx =
+//                                 b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
+//                             let dst_idx =
+//                                 b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
+//                             inp_cont[dst_idx] = inp[src_idx]
+//                         }
+//                     }
+//                 }
+//             }
+//             Cow::Owned(inp_cont)
+//         };
+//         println!("- conv2d copy: {:?}", start.elapsed());
+//         let start = std::time::Instant::now();
+//         let k_cache: Vec<Vec<T>> = (0..p.c_out)
+//             .map(|dst_c_idx| {
+//                 (0..p.k_h * p.k_w)
+//                     .flat_map(|kw_kh| {
+//                         let offset_h = kw_kh / p.k_w;
+//                         let offset_w = kw_kh % p.k_w;
+//                         (0..p.c_in).map(move |c_in_idx| {
+//                             k[dst_c_idx * k_s0
+//                                 + c_in_idx * k_s1
+//                                 + offset_h * k_s2
+//                                 + offset_w * k_s3]
+//                         })
+//                     })
+//                     .collect()
+//             })
+//             .collect();
+//         println!("- conv2d k_cache: {:?}", start.elapsed());
+
+//         for offset_h in 0..p.k_h {
+//             let start = std::time::Instant::now();
+//             for offset_w in 0..p.k_w {
+//                 let start = std::time::Instant::now();
+//                 let k_offset = offset_h * p.k_w + offset_w;
+
+//                 (0..p.c_out).into_par_iter().for_each(|dst_c_idx| {
+//                     let k_cont = &k_cache[dst_c_idx][k_offset * p.c_in..(k_offset + 1) * p.c_in];
+//                     let base_dst_idx = dst_c_idx * out_w * out_h;
+
+//                     for b_idx in 0..p.b_size {
+//                         let batch_dst_idx = base_dst_idx + b_idx * p.c_out * out_h * out_w;
+//                         let batch_src_idx = b_idx * cont_s0;
+
+//                         for dst_h in 0..out_h {
+//                             let src_h = p.stride * dst_h + offset_h * p.dilation;
+//                             if src_h < p.padding || src_h >= p.i_h + p.padding {
+//                                 continue;
+//                             }
+//                             let src_h = src_h - p.padding;
+//                             let h_dst_idx = batch_dst_idx + dst_h * out_w;
+//                             let h_src_idx = batch_src_idx + src_h * cont_s1;
+
+//                             // SIMD-optimized inner loop processing multiple dst_w at once
+//                             const SIMD_LANES: usize = 8;
+//                             let num_chunks = out_w / SIMD_LANES;
+//                             let remainder = out_w % SIMD_LANES;
+
+//                             // Process SIMD_LANES output positions at once
+//                             for chunk in 0..num_chunks {
+//                                 let base_w = chunk * SIMD_LANES;
+//                                 let mut results = [T::zero(); SIMD_LANES];
+
+//                                 for lane in 0..SIMD_LANES {
+//                                     let dst_w = base_w + lane;
+//                                     let src_w = p.stride * dst_w + offset_w * p.dilation;
+//                                     if src_w >= p.padding && src_w < p.i_w + p.padding {
+//                                         let src_w = src_w - p.padding;
+//                                         let inp_cont_slice =
+//                                             &inp_cont[h_src_idx + src_w * cont_s2..];
+
+//                                         unsafe {
+//                                             T::vec_dot(
+//                                                 inp_cont_slice.as_ptr(),
+//                                                 k_cont.as_ptr(),
+//                                                 &mut results[lane],
+//                                                 p.c_in,
+//                                             );
+//                                         }
+//                                     }
+//                                 }
+
+//                                 // Write results back
+//                                 unsafe {
+//                                     for lane in 0..SIMD_LANES {
+//                                         let dst_idx = h_dst_idx + base_w + lane;
+//                                         let ptr = dst.as_ptr().add(dst_idx) as *mut T;
+//                                         *ptr += results[lane];
+//                                     }
+//                                 }
+//                             }
+
+//                             // Handle remainder
+//                             for dst_w in (num_chunks * SIMD_LANES)..out_w {
+//                                 let src_w = p.stride * dst_w + offset_w * p.dilation;
+//                                 if src_w < p.padding || src_w >= p.i_w + p.padding {
+//                                     continue;
+//                                 }
+//                                 let src_w = src_w - p.padding;
+//                                 let dst_idx = h_dst_idx + dst_w;
+//                                 let inp_cont_slice = &inp_cont[h_src_idx + src_w * cont_s2..];
+
+//                                 let mut d = T::zero();
+//                                 unsafe {
+//                                     T::vec_dot(
+//                                         inp_cont_slice.as_ptr(),
+//                                         k_cont.as_ptr(),
+//                                         &mut d,
+//                                         p.c_in,
+//                                     );
+//                                     let ptr = dst.as_ptr().add(dst_idx) as *mut T;
+//                                     *ptr += d;
+//                                 }
+//                             }
+//                         }
+//                     }
+//                 });
+//                 println!(
+//                     "--- {offset_h}:{offset_w} conv2d compute: {:?}",
+//                     start.elapsed()
+//                 );
+//             }
+//             println!("-- {offset_h} conv2d compute: {:?}", start.elapsed());
+//         }
+
+//         Ok(dst)
+//     }
+// }
 
 struct ConvTranspose2D<'a>(&'a crate::conv::ParamsConvTranspose2D);
 
@@ -1323,6 +1726,7 @@ impl Map2 for MatMul {
             _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt())?,
         }
 
+        let start = std::time::Instant::now();
         let (b, m, n, k) = self.0;
         let lhs = &lhs[lhs_l.start_offset()..];
         let rhs = &rhs[rhs_l.start_offset()..];
@@ -1360,6 +1764,8 @@ impl Map2 for MatMul {
         } else {
             (b, m, n, k)
         };
+        println!("-- kernel setup: {:?}", start.elapsed());
+        let start = std::time::Instant::now();
         for step in 0..b {
             let lhs_p = &lhs[step * a_skip..];
             let rhs_p = &rhs[step * b_skip..];
@@ -1388,6 +1794,7 @@ impl Map2 for MatMul {
                 )
             }
         }
+        println!("-- kernel exec: {:?}", start.elapsed());
         Ok(dst)
     }
 
@@ -2465,6 +2872,7 @@ impl BackendStorage for CpuStorage {
         if !USE_IM2COL_CONV2D {
             return Conv2D(params).map(self, l, kernel, kernel_l);
         }
+        let im2col_start = std::time::Instant::now();
         let op = Im2Col {
             h_k: params.k_h,
             w_k: params.k_w,
@@ -2473,6 +2881,7 @@ impl BackendStorage for CpuStorage {
             dilation: params.dilation,
         };
         let col = op.map(self, l)?;
+        println!("-- im2col: {:?}", im2col_start.elapsed());
         let b = params.b_size;
         let n = params.c_out;
         let (h_out, w_out) = (params.out_h(), params.out_w());
@@ -2500,7 +2909,9 @@ impl BackendStorage for CpuStorage {
             .transpose(1, 2)?
             .transpose(1, 3)?;
         let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+        let copy_start = std::time::Instant::now();
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
+        println!("-- copy_strided_src: {:?}", copy_start.elapsed());
         Ok(res_t)
     }
 
