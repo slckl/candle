@@ -1,14 +1,128 @@
 use std::borrow::Cow;
 
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
-use crate::{cpu_backend::Map2, Layout, Result, WithDType};
+use crate::{conv::ParamsConv2D, cpu_backend::Map2, Layout, Result, WithDType};
 
 // Import SIMD types for vectorization
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
+// #[cfg(target_arch = "aarch64")]
+// use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_conv2d_f32<T: WithDType>(
+    mut dst: Vec<T>,
+    inp_cont: &[T],
+    k_cache: &[Vec<T>],
+    p: &ParamsConv2D,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<T> {
+    // Transmute to f32 slices for direct SIMD operations
+    let inp_f32: &[f32] = std::mem::transmute(inp_cont);
+    let dst_f32: &[f32] = std::mem::transmute(dst.as_mut_slice());
+
+    let stride_h = p.stride;
+    let stride_w = p.stride;
+    let dilation = p.dilation;
+    let padding = p.padding;
+
+    let inp_h = p.i_h;
+    let inp_w = p.i_w;
+    let c_in = p.c_in;
+    let k_h = p.k_h;
+    let k_w = p.k_w;
+
+    // Process each batch
+    for b_idx in 0..p.b_size {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        let inp_batch_offset = b_idx * inp_h * inp_w * c_in;
+        let dst_batch_offset = b_idx * p.c_out * out_h * out_w;
+
+        // Process each output channel
+        (0..p.c_out).into_par_iter().for_each(|dst_c_idx| {
+            let k_data_f32: &[f32] = std::mem::transmute(k_cache[dst_c_idx].as_slice());
+            let dst_channel_offset = dst_batch_offset + dst_c_idx * out_h * out_w;
+
+            // Process each output position
+            for out_y in 0..out_h {
+                for out_x in 0..out_w {
+                    let dst_idx = dst_channel_offset + out_y * out_w + out_x;
+
+                    // Calculate input position
+                    let in_y_base = out_y * stride_h;
+                    let in_x_base = out_x * stride_w;
+
+                    // Accumulator for this output position
+                    let mut acc = _mm256_setzero_ps();
+
+                    let mut k_idx = 0;
+
+                    // Iterate over kernel window
+                    for ky in 0..k_h {
+                        for kx in 0..k_w {
+                            let in_y = in_y_base + ky * dilation;
+                            let in_x = in_x_base + kx * dilation;
+
+                            // Check bounds with padding
+                            if in_y >= padding && in_x >= padding {
+                                let in_y_actual = in_y - padding;
+                                let in_x_actual = in_x - padding;
+
+                                if in_y_actual < inp_h && in_x_actual < inp_w {
+                                    let inp_offset = inp_batch_offset
+                                        + in_y_actual * inp_w * c_in
+                                        + in_x_actual * c_in;
+
+                                    // Process input channels in chunks of 8
+                                    let mut c_idx = 0;
+                                    while c_idx + 8 <= c_in {
+                                        let inp_vec = _mm256_loadu_ps(&inp_f32[inp_offset + c_idx]);
+                                        let k_vec = _mm256_loadu_ps(&k_data_f32[k_idx + c_idx]);
+                                        acc = _mm256_fmadd_ps(inp_vec, k_vec, acc);
+                                        c_idx += 8;
+                                    }
+
+                                    // Handle remaining channels
+                                    while c_idx < c_in {
+                                        let ptr = dst_f32.as_ptr().add(dst_idx) as *mut f32;
+                                        *ptr +=
+                                            inp_f32[inp_offset + c_idx] * k_data_f32[k_idx + c_idx];
+                                        // dst_f32[dst_idx] +=
+                                        //     inp_f32[inp_offset + c_idx] * k_data_f32[k_idx + c_idx];
+                                        c_idx += 1;
+                                    }
+                                }
+                            }
+
+                            k_idx += c_in;
+                        }
+                    }
+
+                    // Horizontal sum of accumulator
+                    // acc = [a0, a1, a2, a3, a4, a5, a6, a7]
+                    let acc_high = _mm256_extractf128_ps(acc, 1); // [a4, a5, a6, a7]
+                    let acc_low = _mm256_castps256_ps128(acc); // [a0, a1, a2, a3]
+                    let acc_sum = _mm_add_ps(acc_low, acc_high); // [a0+a4, a1+a5, a2+a6, a3+a7]
+
+                    let acc_sum_high = _mm_movehl_ps(acc_sum, acc_sum); // [a2+a6, a3+a7, ?, ?]
+                    let acc_sum2 = _mm_add_ps(acc_sum, acc_sum_high); // [a0+a4+a2+a6, a1+a5+a3+a7, ?, ?]
+
+                    let acc_sum_high2 = _mm_shuffle_ps(acc_sum2, acc_sum2, 0x1);
+                    let acc_final = _mm_add_ss(acc_sum2, acc_sum_high2);
+
+                    // dst_f32[dst_idx] += _mm_cvtss_f32(acc_final);
+                    let sum = _mm_cvtss_f32(acc_final);
+                    let ptr = dst_f32.as_ptr().add(dst_idx) as *mut f32;
+                    *ptr += sum;
+                }
+            }
+        });
+    }
+
+    dst
+}
 
 pub(super) struct Conv2D<'a>(pub(super) &'a crate::conv::ParamsConv2D);
 
@@ -70,424 +184,19 @@ impl Map2 for Conv2D<'_> {
             .collect();
         // println!("- conv2d k_cache: {:?}", start.elapsed());
 
-        for offset_h in 0..p.k_h {
-            // let start = std::time::Instant::now();
-            for offset_w in 0..p.k_w {
-                // let start = std::time::Instant::now();
-                let k_offset = offset_h * p.k_w + offset_w;
+        // AVX2 optimized version for f32
+        // let start = std::time::Instant::now();
 
-                (0..p.c_out).into_par_iter().for_each(|dst_c_idx| {
-                    let k_cont = &k_cache[dst_c_idx][k_offset * p.c_in..(k_offset + 1) * p.c_in];
-                    let base_dst_idx = dst_c_idx * out_w * out_h;
-
-                    for b_idx in 0..p.b_size {
-                        let batch_dst_idx = base_dst_idx + b_idx * p.c_out * out_h * out_w;
-                        let batch_src_idx = b_idx * cont_s0;
-
-                        for dst_h in 0..out_h {
-                            let src_h = p.stride * dst_h + offset_h * p.dilation;
-                            if src_h < p.padding || src_h >= p.i_h + p.padding {
-                                continue;
-                            }
-                            let src_h = src_h - p.padding;
-                            let h_dst_idx = batch_dst_idx + dst_h * out_w;
-                            let h_src_idx = batch_src_idx + src_h * cont_s1;
-
-                            // SIMD-optimized inner loop: compute multiple dot products in parallel
-                            simd_conv_inner::<T>(
-                                &inp_cont, k_cont, &dst, h_dst_idx, h_src_idx, cont_s2, out_w,
-                                p.stride, offset_w, p.dilation, p.padding, p.i_w, p.c_in,
-                            );
-                        }
-                    }
-                });
-                // println!(
-                // "--- {offset_h}:{offset_w} conv2d compute: {:?}",
-                // start.elapsed()
-                // );
-            }
-            // println!("-- {offset_h} conv2d compute: {:?}", start.elapsed());
+        // Check if we're working with f32, panic otherwise
+        if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f32>() {
+            panic!("AVX2 SIMD convolution only supports f32 dtype");
         }
+
+        // SAFETY: We've verified T is f32 above
+        let dst = unsafe { avx2_conv2d_f32(dst, &inp_cont, &k_cache, p, out_h, out_w) };
+
+        // println!("- conv2d compute: {:?}", start.elapsed());
 
         Ok(dst)
-    }
-}
-
-// Generic SIMD convolution inner loop dispatcher
-#[inline]
-fn simd_conv_inner<T: WithDType>(
-    inp_cont: &[T],
-    k_cont: &[T],
-    dst: &[T],
-    h_dst_idx: usize,
-    h_src_idx: usize,
-    cont_s2: usize,
-    out_w: usize,
-    stride: usize,
-    offset_w: usize,
-    dilation: usize,
-    padding: usize,
-    i_w: usize,
-    c_in: usize,
-) {
-    // Dispatch to type-specific SIMD implementations
-    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-        unsafe {
-            simd_conv_inner_f32(
-                std::mem::transmute(inp_cont),
-                std::mem::transmute(k_cont),
-                std::mem::transmute(dst),
-                h_dst_idx,
-                h_src_idx,
-                cont_s2,
-                out_w,
-                stride,
-                offset_w,
-                dilation,
-                padding,
-                i_w,
-                c_in,
-            );
-        }
-    } else if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
-        unsafe {
-            simd_conv_inner_f64(
-                std::mem::transmute(inp_cont),
-                std::mem::transmute(k_cont),
-                std::mem::transmute(dst),
-                h_dst_idx,
-                h_src_idx,
-                cont_s2,
-                out_w,
-                stride,
-                offset_w,
-                dilation,
-                padding,
-                i_w,
-                c_in,
-            );
-        }
-    } else {
-        // Fallback for other types
-        simd_conv_inner_generic::<T>(
-            inp_cont, k_cont, dst, h_dst_idx, h_src_idx, cont_s2, out_w, stride, offset_w,
-            dilation, padding, i_w, c_in,
-        );
-    }
-}
-
-// SIMD-optimized convolution inner loop for f32
-#[inline]
-#[cfg(target_arch = "x86_64")]
-fn simd_conv_inner_f32(
-    inp_cont: &[f32],
-    k_cont: &[f32],
-    dst: &[f32],
-    h_dst_idx: usize,
-    h_src_idx: usize,
-    cont_s2: usize,
-    out_w: usize,
-    stride: usize,
-    offset_w: usize,
-    dilation: usize,
-    padding: usize,
-    i_w: usize,
-    c_in: usize,
-) {
-    const LANES: usize = 8; // Process 8 output positions in parallel using AVX
-    let num_chunks = out_w / LANES;
-
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            for chunk in 0..num_chunks {
-                let base_w = chunk * LANES;
-                let mut accumulators = [_mm256_setzero_ps(); LANES];
-
-                // Compute which output positions are valid
-                let mut valid_mask = [true; LANES];
-                let mut src_offsets = [0usize; LANES];
-
-                for lane in 0..LANES {
-                    let dst_w = base_w + lane;
-                    let src_w = stride * dst_w + offset_w * dilation;
-                    if src_w < padding || src_w >= i_w + padding {
-                        valid_mask[lane] = false;
-                    } else {
-                        src_offsets[lane] = h_src_idx + (src_w - padding) * cont_s2;
-                    }
-                }
-
-                // Process channel dimension with SIMD for all valid lanes
-                let c_chunks = c_in / 8;
-
-                // Main SIMD loop: process 8 channels at a time for each output position
-                for c_chunk in 0..c_chunks {
-                    let k_offset = c_chunk * 8;
-                    let k_vec = _mm256_loadu_ps(k_cont.as_ptr().add(k_offset));
-
-                    for lane in 0..LANES {
-                        if valid_mask[lane] {
-                            let inp_ptr = inp_cont.as_ptr().add(src_offsets[lane] + k_offset);
-                            let inp_vec = _mm256_loadu_ps(inp_ptr);
-                            let prod = _mm256_mul_ps(inp_vec, k_vec);
-                            accumulators[lane] = _mm256_add_ps(accumulators[lane], prod);
-                        }
-                    }
-                }
-
-                // Handle remainder channels (scalar fallback)
-                let mut remainder_sums = [0.0f32; LANES];
-                for c_idx in (c_chunks * 8)..c_in {
-                    let k_val = *k_cont.get_unchecked(c_idx);
-                    for lane in 0..LANES {
-                        if valid_mask[lane] {
-                            let inp_val = *inp_cont.get_unchecked(src_offsets[lane] + c_idx);
-                            remainder_sums[lane] += inp_val * k_val;
-                        }
-                    }
-                }
-
-                // Horizontal sum and write results
-                for lane in 0..LANES {
-                    if valid_mask[lane] {
-                        let sum = horizontal_sum_avx(accumulators[lane]) + remainder_sums[lane];
-                        let dst_idx = h_dst_idx + base_w + lane;
-                        let ptr = dst.as_ptr().add(dst_idx) as *mut f32;
-                        *ptr += sum;
-                    }
-                }
-            }
-        } else {
-            // Fallback to SSE or scalar
-            simd_conv_inner_generic(
-                inp_cont, k_cont, dst, h_dst_idx, h_src_idx, cont_s2, out_w, stride, offset_w,
-                dilation, padding, i_w, c_in,
-            );
-            return;
-        }
-    }
-
-    // Handle remainder output positions
-    for dst_w in (num_chunks * LANES)..out_w {
-        let src_w = stride * dst_w + offset_w * dilation;
-        if src_w >= padding && src_w < i_w + padding {
-            let src_w = src_w - padding;
-            let dst_idx = h_dst_idx + dst_w;
-            let inp_slice = &inp_cont[h_src_idx + src_w * cont_s2..];
-
-            let mut d = 0.0f32;
-            unsafe {
-                crate::cpu::vec_dot_f32(inp_slice.as_ptr(), k_cont.as_ptr(), &mut d, c_in);
-                let ptr = dst.as_ptr().add(dst_idx) as *mut f32;
-                *ptr += d;
-            }
-        }
-    }
-}
-
-// AVX horizontal sum helper
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn horizontal_sum_avx(v: __m256) -> f32 {
-    let sum1 = _mm256_hadd_ps(v, v);
-    let sum2 = _mm256_hadd_ps(sum1, sum1);
-    let lo = _mm256_castps256_ps128(sum2);
-    let hi = _mm256_extractf128_ps(sum2, 1);
-    let sum3 = _mm_add_ps(lo, hi);
-    _mm_cvtss_f32(sum3)
-}
-
-// Fallback for non-x86_64 architectures
-#[cfg(not(target_arch = "x86_64"))]
-fn simd_conv_inner_f32(
-    inp_cont: &[f32],
-    k_cont: &[f32],
-    dst: &[f32],
-    h_dst_idx: usize,
-    h_src_idx: usize,
-    cont_s2: usize,
-    out_w: usize,
-    stride: usize,
-    offset_w: usize,
-    dilation: usize,
-    padding: usize,
-    i_w: usize,
-    c_in: usize,
-) {
-    simd_conv_inner_generic(
-        inp_cont, k_cont, dst, h_dst_idx, h_src_idx, cont_s2, out_w, stride, offset_w, dilation,
-        padding, i_w, c_in,
-    );
-}
-
-// SIMD-optimized convolution inner loop for f64
-#[inline]
-#[cfg(target_arch = "x86_64")]
-fn simd_conv_inner_f64(
-    inp_cont: &[f64],
-    k_cont: &[f64],
-    dst: &[f64],
-    h_dst_idx: usize,
-    h_src_idx: usize,
-    cont_s2: usize,
-    out_w: usize,
-    stride: usize,
-    offset_w: usize,
-    dilation: usize,
-    padding: usize,
-    i_w: usize,
-    c_in: usize,
-) {
-    const LANES: usize = 4; // Process 4 output positions in parallel using AVX
-    let num_chunks = out_w / LANES;
-
-    unsafe {
-        if is_x86_feature_detected!("avx") {
-            for chunk in 0..num_chunks {
-                let base_w = chunk * LANES;
-                let mut accumulators = [_mm256_setzero_pd(); LANES];
-
-                let mut valid_mask = [true; LANES];
-                let mut src_offsets = [0usize; LANES];
-
-                for lane in 0..LANES {
-                    let dst_w = base_w + lane;
-                    let src_w = stride * dst_w + offset_w * dilation;
-                    if src_w < padding || src_w >= i_w + padding {
-                        valid_mask[lane] = false;
-                    } else {
-                        src_offsets[lane] = h_src_idx + (src_w - padding) * cont_s2;
-                    }
-                }
-
-                let c_chunks = c_in / 4;
-
-                for c_chunk in 0..c_chunks {
-                    let k_offset = c_chunk * 4;
-                    let k_vec = _mm256_loadu_pd(k_cont.as_ptr().add(k_offset));
-
-                    for lane in 0..LANES {
-                        if valid_mask[lane] {
-                            let inp_ptr = inp_cont.as_ptr().add(src_offsets[lane] + k_offset);
-                            let inp_vec = _mm256_loadu_pd(inp_ptr);
-                            let prod = _mm256_mul_pd(inp_vec, k_vec);
-                            accumulators[lane] = _mm256_add_pd(accumulators[lane], prod);
-                        }
-                    }
-                }
-
-                let mut remainder_sums = [0.0f64; LANES];
-                for c_idx in (c_chunks * 4)..c_in {
-                    let k_val = *k_cont.get_unchecked(c_idx);
-                    for lane in 0..LANES {
-                        if valid_mask[lane] {
-                            let inp_val = *inp_cont.get_unchecked(src_offsets[lane] + c_idx);
-                            remainder_sums[lane] += inp_val * k_val;
-                        }
-                    }
-                }
-
-                for lane in 0..LANES {
-                    if valid_mask[lane] {
-                        let sum = horizontal_sum_avx_pd(accumulators[lane]) + remainder_sums[lane];
-                        let dst_idx = h_dst_idx + base_w + lane;
-                        let ptr = dst.as_ptr().add(dst_idx) as *mut f64;
-                        *ptr += sum;
-                    }
-                }
-            }
-        } else {
-            simd_conv_inner_generic(
-                inp_cont, k_cont, dst, h_dst_idx, h_src_idx, cont_s2, out_w, stride, offset_w,
-                dilation, padding, i_w, c_in,
-            );
-            return;
-        }
-    }
-
-    for dst_w in (num_chunks * LANES)..out_w {
-        let src_w = stride * dst_w + offset_w * dilation;
-        if src_w >= padding && src_w < i_w + padding {
-            let src_w = src_w - padding;
-            let dst_idx = h_dst_idx + dst_w;
-            let inp_slice = &inp_cont[h_src_idx + src_w * cont_s2..];
-
-            let mut d = 0.0f64;
-            // Scalar fallback for f64 (no vec_dot_f64 available in crate::cpu)
-            for i in 0..c_in {
-                d += inp_slice[i] * k_cont[i];
-            }
-            unsafe {
-                let ptr = dst.as_ptr().add(dst_idx) as *mut f64;
-                *ptr += d;
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn horizontal_sum_avx_pd(v: __m256d) -> f64 {
-    let sum1 = _mm256_hadd_pd(v, v);
-    let lo = _mm256_castpd256_pd128(sum1);
-    let hi = _mm256_extractf128_pd(sum1, 1);
-    let sum2 = _mm_add_pd(lo, hi);
-    _mm_cvtsd_f64(sum2)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn simd_conv_inner_f64(
-    inp_cont: &[f64],
-    k_cont: &[f64],
-    dst: &[f64],
-    h_dst_idx: usize,
-    h_src_idx: usize,
-    cont_s2: usize,
-    out_w: usize,
-    stride: usize,
-    offset_w: usize,
-    dilation: usize,
-    padding: usize,
-    i_w: usize,
-    c_in: usize,
-) {
-    simd_conv_inner_generic(
-        inp_cont, k_cont, dst, h_dst_idx, h_src_idx, cont_s2, out_w, stride, offset_w, dilation,
-        padding, i_w, c_in,
-    );
-}
-
-// Generic fallback implementation
-#[inline]
-fn simd_conv_inner_generic<T: WithDType>(
-    inp_cont: &[T],
-    k_cont: &[T],
-    dst: &[T],
-    h_dst_idx: usize,
-    h_src_idx: usize,
-    cont_s2: usize,
-    out_w: usize,
-    stride: usize,
-    offset_w: usize,
-    dilation: usize,
-    padding: usize,
-    i_w: usize,
-    c_in: usize,
-) {
-    for dst_w in 0..out_w {
-        let src_w = stride * dst_w + offset_w * dilation;
-        if src_w < padding || src_w >= i_w + padding {
-            continue;
-        }
-        let src_w = src_w - padding;
-        let dst_idx = h_dst_idx + dst_w;
-        let inp_slice = &inp_cont[h_src_idx + src_w * cont_s2..];
-
-        let mut d = T::zero();
-        unsafe {
-            T::vec_dot(inp_slice.as_ptr(), k_cont.as_ptr(), &mut d, c_in);
-            let ptr = dst.as_ptr().add(dst_idx) as *mut T;
-            *ptr += d;
-        }
     }
 }

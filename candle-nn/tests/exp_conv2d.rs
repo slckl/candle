@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use candle::{DType, Device, Module, Tensor};
@@ -63,23 +63,36 @@ fn just_conv() -> Result<()> {
         conv_config,
         vb.pp("conv"),
     )?;
-    // warmup
-    for _ in 0..10 {
-        println!("---");
+    const ITERS: usize = 1000;
+    const WARMUP: usize = 100;
+    let mut min = Duration::MAX;
+    let mut max = Duration::ZERO;
+    let mut total = Duration::ZERO;
+    for i in 0..ITERS + WARMUP {
+        // println!("---");
         let start = Instant::now();
         let _ = conv_layer.forward(&input_tensor)?;
         device.synchronize()?;
-        println!("done in {:?}", start.elapsed());
+        let elapsed = start.elapsed();
+        if i > WARMUP {
+            total += elapsed;
+            if elapsed < min {
+                min = elapsed;
+            }
+            if elapsed > max {
+                max = elapsed;
+            }
+        }
+        // println!("conv2d {:?}", start.elapsed());
     }
     device.synchronize()?;
 
-    // println!("---");
-    // let start = Instant::now();
-    // let _ = conv_layer.forward(&input_tensor)?;
-
-    // device.synchronize()?;
-    // let elapsed = start.elapsed();
-    // println!("op finished in {elapsed:?}");
+    println!(
+        "{ITERS} iters, min/avg/max: [{:?} {:?} {:?}]",
+        min,
+        total / ITERS as u32,
+        max
+    );
 
     Ok(())
 }
