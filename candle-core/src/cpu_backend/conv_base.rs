@@ -119,7 +119,7 @@ impl Map2 for Conv2D<'_> {
                                 let dst_idx = h_dst_idx + dst_w;
                                 // println!("dst_idx: {dst_idx}");
                                 let inp_idx_1 = h_src_idx + src_w * cont_s2;
-                                let inp_idx_2 = (inp_idx_1 + p.c_in).max(inp_cont_len);
+                                let inp_idx_2 = (inp_idx_1 + p.c_in).min(inp_cont_len);
                                 let inp_cont = &inp_cont[inp_idx_1..inp_idx_2];
                                 // let inp_cont = &inp_cont[h_src_idx + src_w * cont_s2..];
                                 // println!(

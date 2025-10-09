@@ -9,6 +9,7 @@ use half::{bf16, f16};
 use rayon::prelude::*;
 
 mod conv_base;
+mod conv_igemm;
 mod conv_simd;
 mod utils;
 pub use utils::{
@@ -1023,6 +1024,46 @@ impl Map1 for Im2Col {
         // - padding = 0
         // - stride = 1
         // - dilation = 1
+        // (0..b)
+        //     .flat_map(|b_idx| (0..c).map(move |c_idx| (b_idx, c_idx)))
+        //     .collect::<Vec<_>>()
+        //     .into_par_iter()
+        //     .for_each(|(b_idx, c_idx)| {
+        //         let src_idx = b_idx * src_s0 + c_idx * src_s1;
+        //         let dst_idx = (b_idx * c + c_idx) * h_out * w_out * h_k * w_k;
+        //         // let dst_idx = b_idx * h_out * w_out * c * h_k * w_k;
+        //         for h_idx in 0..h_out {
+        //             let dst_idx = dst_idx + h_idx * w_out * h_k * w_k;
+        //             for w_idx in 0..w_out {
+        //                 let dst_idx = dst_idx + w_idx * h_k * w_k;
+        //                 let src_idx = src_idx;
+        //                 for h_k_idx in 0..h_k {
+        //                     let src_h = h_idx * stride + h_k_idx * dilation;
+        //                     if padding != 0 && (src_h < padding || src_h >= h + padding) {
+        //                         continue;
+        //                     }
+        //                     let src_h = src_h - padding;
+        //                     let src_idx = src_idx + src_h * src_s2;
+        //                     let dst_idx = dst_idx + h_k_idx * w_k;
+        //                     for w_k_idx in 0..w_k {
+        //                         let src_w = w_idx * stride + w_k_idx * dilation;
+        //                         if padding != 0 && (src_w < padding || src_w >= w + padding) {
+        //                             continue;
+        //                         }
+        //                         let src_w = src_w - padding;
+        //                         let src_idx = src_idx + src_w * src_s3;
+        //                         let dst_idx = dst_idx + w_k_idx;
+        //                         // SAFETY: we only write to dst_idx once, so there's no concurrency issues
+        //                         unsafe {
+        //                             let ptr = dst.as_ptr().add(dst_idx) as *mut T;
+        //                             *ptr = src[src_idx]
+        //                         }
+        //                         // dst[dst_idx] = src[src_idx]
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     });
         for b_idx in 0..b {
             let src_idx = b_idx * src_s0;
             let dst_idx = b_idx * h_out * w_out * c * h_k * w_k;
@@ -1221,12 +1262,13 @@ impl Map2 for ConvTranspose1D<'_> {
     }
 }
 
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-#[cfg(not(target_feature = "avx2"))]
-use conv_base::Conv2D;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[cfg(target_feature = "avx2")]
-use conv_simd::Conv2D;
+// #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+// #[cfg(not(target_feature = "avx2"))]
+// use conv_base::Conv2D;
+// #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// #[cfg(target_feature = "avx2")]
+// use conv_simd::Conv2D;
+use conv_igemm::Conv2D;
 
 // TODO insert the final conv2d impl here
 
@@ -1376,7 +1418,7 @@ impl Map2 for MatMul {
             _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt())?,
         }
 
-        let start = std::time::Instant::now();
+        // let start = std::time::Instant::now();
         let (b, m, n, k) = self.0;
         let lhs = &lhs[lhs_l.start_offset()..];
         let rhs = &rhs[rhs_l.start_offset()..];
@@ -1414,8 +1456,8 @@ impl Map2 for MatMul {
         } else {
             (b, m, n, k)
         };
-        println!("-- kernel setup: {:?}", start.elapsed());
-        let start = std::time::Instant::now();
+        // println!("-- kernel setup: {:?}", start.elapsed());
+        // let start = std::time::Instant::now();
         for step in 0..b {
             let lhs_p = &lhs[step * a_skip..];
             let rhs_p = &rhs[step * b_skip..];
@@ -1444,7 +1486,7 @@ impl Map2 for MatMul {
                 )
             }
         }
-        println!("-- kernel exec: {:?}", start.elapsed());
+        // println!("-- kernel exec: {:?}", start.elapsed());
         Ok(dst)
     }
 
