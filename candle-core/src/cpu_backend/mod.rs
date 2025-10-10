@@ -1,6 +1,4 @@
 //! Implementation of Backend Fns for CPU
-use std::borrow::Cow;
-
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{DType, Error, IntDType, Layout, Result, Shape, WithDType};
@@ -20,6 +18,14 @@ const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
 // const USE_IM2COL_CONV2D: bool = true;
 const USE_IM2COL_CONV2D: bool = false;
+
+// #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+// // #[cfg(not(target_feature = "avx2"))]
+// use conv_base::Conv2D;
+// #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// #[cfg(target_feature = "avx2")]
+// use conv_simd::Conv2D;
+use conv_igemm::Conv2D;
 
 // TODO: Maybe we should not implement [Clone] here and instead have an explicit allocator +
 // intercept the oom errors to avoid panicking and provide a proper error.
@@ -1261,14 +1267,6 @@ impl Map2 for ConvTranspose1D<'_> {
         Ok(dst)
     }
 }
-
-// #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-// #[cfg(not(target_feature = "avx2"))]
-// use conv_base::Conv2D;
-// #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-// #[cfg(target_feature = "avx2")]
-// use conv_simd::Conv2D;
-use conv_igemm::Conv2D;
 
 // TODO insert the final conv2d impl here
 
@@ -2564,7 +2562,7 @@ impl BackendStorage for CpuStorage {
         if !USE_IM2COL_CONV2D {
             return Conv2D(params).map(self, l, kernel, kernel_l);
         }
-        let im2col_start = std::time::Instant::now();
+        // let im2col_start = std::time::Instant::now();
         let op = Im2Col {
             h_k: params.k_h,
             w_k: params.k_w,
@@ -2573,7 +2571,7 @@ impl BackendStorage for CpuStorage {
             dilation: params.dilation,
         };
         let col = op.map(self, l)?;
-        println!("-- im2col: {:?}", im2col_start.elapsed());
+        // println!("-- im2col: {:?}", im2col_start.elapsed());
         let b = params.b_size;
         let n = params.c_out;
         let (h_out, w_out) = (params.out_h(), params.out_w());
@@ -2601,9 +2599,9 @@ impl BackendStorage for CpuStorage {
             .transpose(1, 2)?
             .transpose(1, 3)?;
         let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
-        let copy_start = std::time::Instant::now();
+        // let copy_start = std::time::Instant::now();
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
-        println!("-- copy_strided_src: {:?}", copy_start.elapsed());
+        // println!("-- copy_strided_src: {:?}", copy_start.elapsed());
         Ok(res_t)
     }
 

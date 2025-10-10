@@ -2,7 +2,11 @@ use std::borrow::Cow;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::{cpu_backend::Map2, Layout, Result, WithDType};
+use crate::{
+    cpu_backend::{Map2, MatMul},
+    shape::dims4,
+    Layout, Result, WithDType,
+};
 
 pub(super) struct Conv2D<'a>(pub(super) &'a crate::conv::ParamsConv2D);
 
@@ -17,13 +21,13 @@ impl Map2 for Conv2D<'_> {
     ) -> Result<Vec<T>> {
         let p = self.0;
         let inp = &inp[inp_l.start_offset()..];
-        let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
+        let (inp_s0, inp_s1, inp_s2, inp_s3) = dims4(inp_l.stride())?;
         let k = &k[k_l.start_offset()..];
-        let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
+        let (k_s0, k_s1, k_s2, k_s3) = dims4(k_l.stride())?;
         let (out_h, out_w) = (p.out_h(), p.out_w());
 
         // Output shape: [b_size, c_out, out_h, out_w].
-        let mut dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
+        let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
 
         // let start = std::time::Instant::now();
         let cont_s0 = p.i_h * p.i_w * p.c_in;
@@ -50,26 +54,31 @@ impl Map2 for Conv2D<'_> {
             Cow::Owned(inp_cont)
         };
         // println!("- conv2d copy: {:?}", start.elapsed());
-
         // let start = std::time::Instant::now();
-        let k_cache: Vec<Vec<T>> = (0..p.c_out)
-            .map(|dst_c_idx| {
-                (0..p.k_h * p.k_w)
-                    .flat_map(|kw_kh| {
-                        let offset_h = kw_kh / p.k_w;
-                        let offset_w = kw_kh % p.k_w;
-                        (0..p.c_in).map(move |c_in_idx| {
-                            k[dst_c_idx * k_s0
-                                + c_in_idx * k_s1
-                                + offset_h * k_s2
-                                + offset_w * k_s3]
-                        })
+        // shape of k: [c_out, c_in, k_h, k_w]
+        // strides of k: [k_s0, k_s1, k_s2, k_s3]
+        // For matmul, we need k in shape [c_out, k_h * k_w * c_in]
+        // with stride [k_h * k_w * c_in, 1]
+        let k_flat: Vec<T> = (0..p.c_out)
+            .flat_map(|dst_c_idx| {
+                (0..p.k_h * p.k_w).flat_map(move |kw_kh| {
+                    let offset_h = kw_kh / p.k_w;
+                    let offset_w = kw_kh % p.k_w;
+                    (0..p.c_in).map(move |c_in_idx| {
+                        k[dst_c_idx * k_s0 + c_in_idx * k_s1 + offset_h * k_s2 + offset_w * k_s3]
                     })
-                    .collect()
+                })
             })
             .collect();
-        // Flatten k_cache into a single vector for matmul
-        let k_flat: Vec<T> = k_cache.iter().flat_map(|row| row.iter().copied()).collect();
+        // k_flat.len: 432
+        // println!("k_flat.len(): {}", k_flat.len());
+        let k_size = p.c_in * p.k_h * p.k_w;
+        // println!("k_size: {k_size}");
+        // k_size 27
+        // k_flat layout: [c_out, k_size] with stride [k_size, 1]
+        let k_layout = Layout::contiguous((p.c_out, k_size));
+        // k_layout: [16, 27] stride: [27, 1]
+        // println!("k_layout: {k_layout:?}");
         // println!("- conv2d k_cache: {:?}", start.elapsed());
 
         // let start = std::time::Instant::now();
@@ -78,23 +87,18 @@ impl Map2 for Conv2D<'_> {
         // Tile size (number of output pixels to process at once)
         const TILE_SIZE: usize = 64;
 
-        let k_size = p.c_in * p.k_h * p.k_w;
-        // let mut col_tile = vec![T::zero(); k_size * TILE_SIZE];
         let total_out_pixels = out_h * out_w;
 
-        // Process each batch
-        // (0..p.b_size).into_par_iter().for_each(|b_idx| {
         for b_idx in 0..p.b_size {
             let inp_offset = b_idx * cont_s0;
             let out_batch_offset = b_idx * (p.c_out * out_h * out_w);
 
-            // Process output in tiles
-            // for tile_start in
+            // Process output in tiles, in parallel using rayon.
             (0..total_out_pixels)
                 .step_by(TILE_SIZE)
                 .collect::<Vec<_>>()
                 .into_par_iter()
-                .for_each(|tile_start| {
+                .try_for_each(|tile_start| {
                     // Determine actual tile size (may be smaller at the end) {
                     let tile_end = (tile_start + TILE_SIZE).min(total_out_pixels);
                     let tile_size = tile_end - tile_start;
@@ -102,8 +106,6 @@ impl Map2 for Conv2D<'_> {
                     // Build im2col tile: [k_size, tile_size]
                     // This represents the input patches needed for this tile of outputs
                     let mut col_tile = vec![T::zero(); k_size * tile_size];
-                    // col_tile.resize(k_size * tile_size, T::zero());
-                    // col_tile.fill(T::zero());
 
                     for tile_idx in 0..tile_size {
                         let out_pixel_idx = tile_start + tile_idx;
@@ -142,21 +144,15 @@ impl Map2 for Conv2D<'_> {
                     }
 
                     // Now perform matmul: k_cache [c_out, k_size] @ col_tile [k_size, tile_size]
-                    // Use MatMul::f for efficient computation
-                    let matmul = super::MatMul((1, p.c_out, tile_size, k_size));
+                    let matmul = MatMul((1, p.c_out, tile_size, k_size));
 
                     // Create layouts for matmul
                     // k_flat layout: [c_out, k_size] with stride [k_size, 1]
-                    let k_layout = Layout::contiguous((p.c_out, k_size));
-
                     // col_tile layout: [k_size, tile_size] with stride [tile_size, 1]
                     let col_layout = Layout::contiguous((k_size, tile_size));
 
                     // Perform matmul
-                    // FIXME replace with ? if rayon gives us anything
-                    let result = matmul
-                        .f(&k_flat, &k_layout, &col_tile, &col_layout)
-                        .unwrap();
+                    let result = matmul.f(&k_flat, &k_layout, &col_tile, &col_layout)?;
 
                     // Copy results to output: result is [c_out, tile_size]
                     for c_out_idx in 0..p.c_out {
@@ -174,10 +170,10 @@ impl Map2 for Conv2D<'_> {
                                 let ptr = dst.as_ptr().add(dst_idx) as *mut T;
                                 *ptr = result[result_idx];
                             }
-                            // dst[dst_idx] = result[result_idx];
                         }
                     }
-                });
+                    Ok::<(), crate::Error>(())
+                })?;
         }
 
         // println!("- conv2d compute: {:?}", start.elapsed());
