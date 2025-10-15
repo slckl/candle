@@ -59,18 +59,18 @@ impl Map2 for Conv2D<'_> {
         // strides of k: [k_s0, k_s1, k_s2, k_s3]
         // For matmul, we need k in shape [c_out, k_h * k_w * c_in]
         // with stride [k_h * k_w * c_in, 1]
-        let k_flat: Vec<T> = (0..p.c_out)
-            .flat_map(|dst_c_idx| {
-                (0..p.k_h * p.k_w).flat_map(move |kw_kh| {
-                    let offset_h = kw_kh / p.k_w;
-                    let offset_w = kw_kh % p.k_w;
-                    (0..p.c_in).map(move |c_in_idx| {
-                        k[dst_c_idx * k_s0 + c_in_idx * k_s1 + offset_h * k_s2 + offset_w * k_s3]
-                    })
-                })
-            })
-            .collect();
         let k_size = p.c_in * p.k_h * p.k_w;
+        let mut k_flat = Vec::with_capacity(p.c_out * k_size);
+        for dst_c_idx in 0..p.c_out {
+            for kh in 0..p.k_h {
+                for kw in 0..p.k_w {
+                    for c_in_idx in 0..p.c_in {
+                        let k_idx = dst_c_idx * k_s0 + c_in_idx * k_s1 + kh * k_s2 + kw * k_s3;
+                        k_flat.push(k[k_idx]);
+                    }
+                }
+            }
+        }
         // k_layout: [c_out, k_size] with stride [k_size, 1]
         // k_layout: [16, 27] stride: [27, 1]
         let k_layout = Layout::contiguous((p.c_out, k_size));
