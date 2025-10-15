@@ -26,6 +26,57 @@ impl Map2 for Conv2D<'_> {
         let (k_s0, k_s1, k_s2, k_s3) = dims4(k_l.stride())?;
         let (out_h, out_w) = (p.out_h(), p.out_w());
 
+        // Fast path for 1x1 convolutions with stride=1, padding=0, dilation=1
+        // These are just matrix multiplications: [c_out, c_in] @ [c_in, b*h*w] -> [c_out, b*h*w]
+        if p.k_h == 1 && p.k_w == 1 && p.stride == 1 && p.padding == 0 && p.dilation == 1 {
+            let spatial_size = p.i_h * p.i_w;
+            let dst = vec![T::zero(); p.b_size * p.c_out * spatial_size];
+
+            // Reshape kernel to [c_out, c_in]
+            let mut k_reshaped = Vec::with_capacity(p.c_out * p.c_in);
+            for c_out_idx in 0..p.c_out {
+                for c_in_idx in 0..p.c_in {
+                    let k_idx = c_out_idx * k_s0 + c_in_idx * k_s1;
+                    k_reshaped.push(k[k_idx]);
+                }
+            }
+            let k_layout = Layout::contiguous((p.c_out, p.c_in));
+
+            // Process each batch
+            (0..p.b_size).into_par_iter().try_for_each(|b_idx| {
+                // Reshape input to [c_in, h*w] for this batch
+                let mut inp_reshaped = Vec::with_capacity(p.c_in * spatial_size);
+                for c_in_idx in 0..p.c_in {
+                    for h_idx in 0..p.i_h {
+                        for w_idx in 0..p.i_w {
+                            let inp_idx = b_idx * inp_s0
+                                + c_in_idx * inp_s1
+                                + h_idx * inp_s2
+                                + w_idx * inp_s3;
+                            inp_reshaped.push(inp[inp_idx]);
+                        }
+                    }
+                }
+                let inp_layout = Layout::contiguous((p.c_in, spatial_size));
+
+                // Perform matmul: [c_out, c_in] @ [c_in, spatial_size] -> [c_out, spatial_size]
+                let matmul = MatMul((1, p.c_out, spatial_size, p.c_in));
+                let result = matmul.f(&k_reshaped, &k_layout, &inp_reshaped, &inp_layout)?;
+
+                // Copy result to output
+                let out_offset = b_idx * p.c_out * spatial_size;
+                for i in 0..result.len() {
+                    unsafe {
+                        let ptr = dst.as_ptr().add(out_offset + i) as *mut T;
+                        *ptr = result[i];
+                    }
+                }
+                Ok::<(), crate::Error>(())
+            })?;
+
+            return Ok(dst);
+        }
+
         // Output shape: [b_size, c_out, out_h, out_w].
         let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
 
