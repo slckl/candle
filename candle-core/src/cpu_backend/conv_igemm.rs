@@ -86,7 +86,9 @@ impl Map2 for Conv2D<'_> {
 
         let total_out_pixels = out_h * out_w;
 
-        for b_idx in 0..p.b_size {
+        // Process batches in parallel using rayon.
+        // Each batch processes its tiles in parallel as well (nested parallelism).
+        (0..p.b_size).into_par_iter().try_for_each(|b_idx| {
             let inp_offset = b_idx * cont_s0;
             let out_batch_offset = b_idx * (p.c_out * out_h * out_w);
 
@@ -160,7 +162,9 @@ impl Map2 for Conv2D<'_> {
                     for c_out_idx in 0..p.c_out {
                         let dst_idx = dst_base + c_out_idx * (out_h * out_w);
                         let result_idx = c_out_idx * tile_size + tile_idx;
-                        // SAFETY: we only write to each dst index once, no overlap between threads.
+                        // SAFETY: Each batch processes a distinct region of the output buffer.
+                        // Within each batch, tiles process non-overlapping output positions.
+                        // Therefore, no two threads will write to the same dst_idx.
                         unsafe {
                             let ptr = dst.as_ptr().add(dst_idx) as *mut T;
                             *ptr = result[result_idx];
@@ -168,8 +172,8 @@ impl Map2 for Conv2D<'_> {
                     }
                 }
                 Ok::<(), crate::Error>(())
-            })?;
-        }
+            })
+        })?;
 
         // println!("- conv2d compute: {:?}", start.elapsed());
 
