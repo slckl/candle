@@ -70,21 +70,18 @@ impl Map2 for Conv2D<'_> {
                 })
             })
             .collect();
-        // k_flat.len: 432
-        // println!("k_flat.len(): {}", k_flat.len());
         let k_size = p.c_in * p.k_h * p.k_w;
-        // println!("k_size: {k_size}");
-        // k_size 27
-        // k_flat layout: [c_out, k_size] with stride [k_size, 1]
-        let k_layout = Layout::contiguous((p.c_out, k_size));
+        // k_layout: [c_out, k_size] with stride [k_size, 1]
         // k_layout: [16, 27] stride: [27, 1]
-        // println!("k_layout: {k_layout:?}");
+        let k_layout = Layout::contiguous((p.c_out, k_size));
         // println!("- conv2d k_cache: {:?}", start.elapsed());
 
         // let start = std::time::Instant::now();
 
-        // Implicit GEMM: process output in cache-friendly tiles
-        // Tile size (number of output pixels to process at once)
+        // Implicit GEMM: process output in tiles, without materializing full im2col matrix.
+        // TILE_SIZE is number of output pixels (out_h * out_w) per tile.
+        // Higher tile size seems to be faster in this implementation, due to better usage of gemm,
+        // but lower tile sizes enable bigger parallelism across tiles.
         const TILE_SIZE: usize = 512;
 
         let total_out_pixels = out_h * out_w;
@@ -153,24 +150,6 @@ impl Map2 for Conv2D<'_> {
                 let result = matmul.f(&k_flat, &k_layout, &col_tile, &col_layout)?;
 
                 // Copy results to output: result is [c_out, tile_size]
-                // for c_out_idx in 0..p.c_out {
-                //     for tile_idx in 0..tile_size {
-                //         let out_pixel_idx = tile_start + tile_idx;
-                //         let out_y = out_pixel_idx / out_w;
-                //         let out_x = out_pixel_idx % out_w;
-                //         let dst_idx =
-                //             out_batch_offset + c_out_idx * (out_h * out_w) + out_y * out_w + out_x;
-                //         let result_idx = c_out_idx * tile_size + tile_idx;
-                //         // SAFETY: we only write to each dst element once
-                //         unsafe {
-                //             let ptr = dst.as_ptr().add(dst_idx) as *mut T;
-                //             *ptr = result[result_idx];
-                //         }
-                //     }
-                // }
-
-                // Copy results to output: result is [c_out, tile_size]
-                // Optimize by iterating tile first, then channels
                 for tile_idx in 0..tile_size {
                     let out_pixel_idx = tile_start + tile_idx;
                     let out_y = out_pixel_idx / out_w;
@@ -180,6 +159,7 @@ impl Map2 for Conv2D<'_> {
                     for c_out_idx in 0..p.c_out {
                         let dst_idx = dst_base + c_out_idx * (out_h * out_w);
                         let result_idx = c_out_idx * tile_size + tile_idx;
+                        // SAFETY: we only write to each dst index once, no overlap between threads.
                         unsafe {
                             let ptr = dst.as_ptr().add(dst_idx) as *mut T;
                             *ptr = result[result_idx];
