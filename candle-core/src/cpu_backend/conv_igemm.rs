@@ -109,30 +109,32 @@ impl Map2 for Conv2D<'_> {
 
                     // Extract the im2col patch for this output position
                     let mut patch_offset = 0;
-                    for kh in 0..p.k_h {
-                        for kw in 0..p.k_w {
-                            let in_y =
-                                (out_y * p.stride + kh * p.dilation) as isize - p.padding as isize;
-                            let in_x =
-                                (out_x * p.stride + kw * p.dilation) as isize - p.padding as isize;
+                    for c_in in 0..p.c_in {
+                        for kh in 0..p.k_h {
+                            for kw in 0..p.k_w {
+                                let in_y = (out_y * p.stride + kh * p.dilation) as isize
+                                    - p.padding as isize;
+                                let in_x = (out_x * p.stride + kw * p.dilation) as isize
+                                    - p.padding as isize;
 
-                            if in_y >= 0
-                                && in_y < p.i_h as isize
-                                && in_x >= 0
-                                && in_x < p.i_w as isize
-                            {
-                                let in_y = in_y as usize;
-                                let in_x = in_x as usize;
-                                for c_in in 0..p.c_in {
+                                if in_y >= 0
+                                    && in_y < p.i_h as isize
+                                    && in_x >= 0
+                                    && in_x < p.i_w as isize
+                                {
+                                    let in_y = in_y as usize;
+                                    let in_x = in_x as usize;
+                                    // for c_in in 0..p.c_in {
                                     let inp_idx =
                                         inp_offset + in_y * cont_s1 + in_x * cont_s2 + c_in;
                                     let col_idx = patch_offset * tile_size + tile_idx;
                                     col_tile[col_idx] = inp_cont[inp_idx];
                                     patch_offset += 1;
+                                    // }
+                                } else {
+                                    // Padding: already zero
+                                    patch_offset += p.c_in;
                                 }
-                            } else {
-                                // Padding: already zero
-                                patch_offset += p.c_in;
                             }
                         }
                     }
