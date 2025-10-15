@@ -8,7 +8,6 @@ use rayon::prelude::*;
 
 mod conv_base;
 mod conv_igemm;
-mod conv_simd;
 mod utils;
 pub use utils::{
     binary_map, binary_map_vec, unary_map, unary_map_vec, Map1, Map1Any, Map2, Map2InPlace, Map2U8,
