@@ -98,14 +98,18 @@ impl Map2 for Conv2D<'_> {
                 let tile_end = (tile_start + TILE_SIZE).min(total_out_pixels);
                 let tile_size = tile_end - tile_start;
 
+                // Precompute output coordinates.
+                // Used in both im2col extraction and writing output.
+                let out_coords: Vec<_> = (tile_start..tile_end)
+                    .map(|idx| (idx / out_w, idx % out_w))
+                    .collect();
+
                 // Build im2col tile: [k_size, tile_size]
                 // This represents the input patches needed for this tile of outputs
                 let mut col_tile = vec![T::zero(); k_size * tile_size];
 
                 for tile_idx in 0..tile_size {
-                    let out_pixel_idx = tile_start + tile_idx;
-                    let out_y = out_pixel_idx / out_w;
-                    let out_x = out_pixel_idx % out_w;
+                    let (out_y, out_x) = out_coords[tile_idx];
 
                     // Extract the im2col patch for this output position
                     let mut patch_offset = 0;
@@ -153,9 +157,7 @@ impl Map2 for Conv2D<'_> {
 
                 // Copy results to output: result is [c_out, tile_size]
                 for tile_idx in 0..tile_size {
-                    let out_pixel_idx = tile_start + tile_idx;
-                    let out_y = out_pixel_idx / out_w;
-                    let out_x = out_pixel_idx % out_w;
+                    let (out_y, out_x) = out_coords[tile_idx];
                     let dst_base = out_batch_offset + out_y * out_w + out_x;
 
                     for c_out_idx in 0..p.c_out {
