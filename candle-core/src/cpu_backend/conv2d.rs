@@ -4,13 +4,14 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
     conv::ParamsConv2D,
-    cpu_backend::{Im2Col, Map1, Map2, MatMul},
+    cpu_backend::{copy_strided_src_, Im2Col, Map1, Map2, MatMul},
     shape::dims4,
     Layout, Result, WithDType,
 };
 
 pub(super) struct Conv2D<'a>(pub(super) &'a crate::conv::ParamsConv2D);
 
+#[allow(dead_code)]
 enum Conv2dImpl {
     TiledGemm,
     Im2ColGemm,
@@ -19,6 +20,7 @@ enum Conv2dImpl {
 
 // const DEFAULT_CONV2D_IMPL: Conv2dImpl = Conv2dImpl::Direct;
 const DEFAULT_CONV2D_IMPL: Conv2dImpl = Conv2dImpl::TiledGemm;
+// const DEFAULT_CONV2D_IMPL: Conv2dImpl = Conv2dImpl::Im2ColGemm;
 
 impl Map2 for Conv2D<'_> {
     const OP: &'static str = "conv2d";
@@ -414,49 +416,56 @@ fn conv2d_direct<T: WithDType + num_traits::Num + Copy + 'static>(
     Ok(dst)
 }
 
+fn alloc_uninit_vec<T: WithDType + Copy + 'static>(size: usize) -> Vec<T> {
+    let mut v = Vec::with_capacity(size);
+    unsafe { v.set_len(size) };
+    v
+}
+
 fn conv2d_im2col_gemm<T: WithDType + num_traits::Num + Copy + 'static>(
-    _p: &ParamsConv2D,
-    _inp: &[T],
-    _inp_l: &Layout,
-    _k: &[T],
-    _k_l: &Layout,
+    p: &ParamsConv2D,
+    inp: &[T],
+    inp_l: &Layout,
+    kernel: &[T],
+    kernel_l: &Layout,
 ) -> Result<Vec<T>> {
-    todo!()
-    // let op = Im2Col {
-    //     h_k: p.k_h,
-    //     w_k: p.k_w,
-    //     padding: p.padding,
-    //     stride: p.stride,
-    //     dilation: p.dilation,
-    // };
-    // let col = op.f(inp, inp_l)?;
-    // // println!("-- im2col: {:?}", im2col_start.elapsed());
-    // let b = p.b_size;
-    // let n = p.c_out;
-    // let (h_out, w_out) = (p.out_h(), p.out_w());
-    // let k = op.h_k * op.w_k * p.c_in;
-    // let m = h_out * w_out;
-    // let col_l = Layout::contiguous((b, m, k));
-    // let res = if k_l.is_contiguous() {
-    //     let kernel_l = Layout::contiguous_with_offset((1, n, k), k_l.start_offset())
-    //         .transpose(1, 2)?
-    //         .broadcast_as((b, k, n))?;
-    //     col.matmul(k, (b, m, n, k), &col_l, &kernel_l)?
-    // } else {
-    //     // Make the kernel contiguous if not already the case.
-    //     let mut kernel_c = unsafe { self.device().alloc_uninit(k_l.shape(), k.dtype())? };
-    //     k.copy_strided_src(&mut kernel_c, 0, k_l)?;
-    //     let kernel_l = Layout::contiguous_with_offset((1, n, k), k_l.start_offset())
-    //         .transpose(1, 2)?
-    //         .broadcast_as((b, k, n))?;
-    //     col.matmul(k, (b, m, n, k), &col_l, &kernel_l)?
-    // };
-    // let res_l = Layout::contiguous((b, h_out, w_out, p.c_out))
-    //     .transpose(1, 2)?
-    //     .transpose(1, 3)?;
-    // let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
-    // // let copy_start = std::time::Instant::now();
+    let op = Im2Col {
+        h_k: p.k_h,
+        w_k: p.k_w,
+        padding: p.padding,
+        stride: p.stride,
+        dilation: p.dilation,
+    };
+    let col = op.f(inp, inp_l)?;
+    // println!("-- im2col: {:?}", im2col_start.elapsed());
+    let b = p.b_size;
+    let n = p.c_out;
+    let (h_out, w_out) = (p.out_h(), p.out_w());
+    let k = op.h_k * op.w_k * p.c_in;
+    let m = h_out * w_out;
+    let col_l = Layout::contiguous((b, m, k));
+    let res: Vec<T> = if kernel_l.is_contiguous() {
+        let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            .transpose(1, 2)?
+            .broadcast_as((b, k, n))?;
+        MatMul((b, m, n, k)).f(&col, &col_l, &kernel, &kernel_l)?
+    } else {
+        // Make the kernel contiguous if not already the case.
+        let mut kernel_c = alloc_uninit_vec(kernel_l.shape().elem_count());
+        copy_strided_src_(kernel, &mut kernel_c, 0, kernel_l);
+        // kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+        let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            .transpose(1, 2)?
+            .broadcast_as((b, k, n))?;
+        MatMul((b, m, n, k)).f(&col, &col_l, &kernel_c, &kernel_l)?
+    };
+    let res_l = Layout::contiguous((b, h_out, w_out, p.c_out))
+        .transpose(1, 2)?
+        .transpose(1, 3)?;
+    let mut res_t = alloc_uninit_vec(res_l.shape().elem_count());
+    // let copy_start = std::time::Instant::now();
+    copy_strided_src_(&res, &mut res_t, 0, &res_l);
     // res.copy_strided_src(&mut res_t, 0, &res_l)?;
-    // // println!("-- copy_strided_src: {:?}", copy_start.elapsed());
-    // Ok(res_t)
+    // println!("-- copy_strided_src: {:?}", copy_start.elapsed());
+    Ok(res_t)
 }

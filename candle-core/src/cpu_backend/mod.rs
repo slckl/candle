@@ -760,7 +760,12 @@ fn copy2d_<T: Copy>(
     }
 }
 
-fn copy_strided_src_<T: Copy>(src: &[T], dst: &mut [T], dst_offset: usize, src_l: &Layout) {
+pub(crate) fn copy_strided_src_<T: Copy>(
+    src: &[T],
+    dst: &mut [T],
+    dst_offset: usize,
+    src_l: &Layout,
+) {
     match src_l.strided_blocks() {
         crate::StridedBlocks::SingleBlock { start_offset, len } => {
             let to_copy = (dst.len() - dst_offset).min(len);
@@ -1257,8 +1262,6 @@ impl Map2 for ConvTranspose1D<'_> {
         Ok(dst)
     }
 }
-
-// TODO insert the final conv2d impl here
 
 struct ConvTranspose2D<'a>(&'a crate::conv::ParamsConvTranspose2D);
 
@@ -2550,9 +2553,9 @@ impl BackendStorage for CpuStorage {
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
         Conv2D(params).map(self, l, kernel, kernel_l)
-        // if !USE_IM2COL_CONV2D {
-        //     return Conv2D(params).map(self, l, kernel, kernel_l);
-        // }
+        // // if !USE_IM2COL_CONV2D {
+        // // return Conv2D(params).map(self, l, kernel, kernel_l);
+        // // }
         // // let im2col_start = std::time::Instant::now();
         // let op = Im2Col {
         //     h_k: params.k_h,
