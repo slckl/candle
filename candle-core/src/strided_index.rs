@@ -6,7 +6,7 @@ use crate::Layout;
 // pub struct StridedIndex<'a> {
 pub struct StridedIndex {
     next_storage_index: Option<usize>,
-    precomp: Vec<((usize, usize), usize)>,
+    multi_index: Vec<(usize, usize, usize)>,
     // multi_index: Vec<usize>,
     // dims: &'a [usize],
     // stride: &'a [usize],
@@ -23,22 +23,15 @@ impl StridedIndex {
             Some(start_offset)
         };
         // Precompute multi index iterator.
-        let multi_index = vec![0usize; dims.len()];
-        let precomp: Vec<((usize, usize), usize)> = multi_index
-            .into_iter()
-            .zip(dims.iter().copied())
-            .zip(stride.iter().copied())
+        let multi_index: Vec<_> = dims
+            .iter()
+            .zip(stride.iter())
             .rev()
+            .map(|(dim, stride)| (0, *dim, *stride))
             .collect();
-        // StridedIndex {
-        //     next_storage_index,
-        //     multi_index: vec![0; dims.len()],
-        //     dims,
-        //     stride,
-        // }
         StridedIndex {
             next_storage_index,
-            precomp,
+            multi_index,
         }
     }
 
@@ -54,7 +47,7 @@ impl Iterator for StridedIndex {
         let storage_index = self.next_storage_index?;
         let mut updated = false;
         let mut next_storage_index = storage_index;
-        for ((multi_i, max_i), stride_i) in self.precomp.iter_mut() {
+        for (multi_i, max_i, stride_i) in self.multi_index.iter_mut() {
             let next_i = *multi_i + 1;
             if next_i < *max_i {
                 *multi_i = next_i;
