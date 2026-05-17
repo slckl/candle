@@ -166,8 +166,9 @@ impl Model {
             }
         }
 
+        let _ = (b_size, seq_len);
         self.language_model
-            .forward_embeds(&input_embeds, seqlen_offset, b_size, seq_len)
+            .forward_embeds(input_ids, &input_embeds, seqlen_offset)
     }
 
     pub fn clear_kv_cache(&mut self) {

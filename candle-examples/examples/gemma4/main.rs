@@ -91,10 +91,11 @@ impl TextGeneration {
         std::io::stdout().flush()?;
 
         let mut generated_tokens = 0usize;
-        let eos_token = match self.tokenizer.get_token("</s>") {
+        let eos_token = match self.tokenizer.get_token("<eos>") {
             Some(token) => token,
-            None => anyhow::bail!("cannot find the </s> token"),
+            None => anyhow::bail!("cannot find the <eos> token"),
         };
+        let end_of_turn_token = self.tokenizer.get_token("<turn|>");
         let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
@@ -120,7 +121,7 @@ impl TextGeneration {
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
             generated_tokens += 1;
-            if next_token == eos_token {
+            if next_token == eos_token || Some(next_token) == end_of_turn_token {
                 break;
             }
             if let Some(t) = self.tokenizer.next_token(next_token)? {
@@ -196,6 +197,11 @@ struct Args {
     /// Load the multimodal model (vision + audio encoders).
     #[arg(long)]
     multimodal: bool,
+
+    /// Pass the prompt through verbatim instead of wrapping it in the gemma4
+    /// instruction-tuned chat template.
+    #[arg(long)]
+    raw_prompt: bool,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
@@ -303,7 +309,9 @@ fn main() -> Result<()> {
             }
         };
         config.use_flash_attn = args.use_flash_attn;
-        let model = TextModel::new(&config, vb)?;
+        // The released gemma-4 checkpoints are multimodal; the language model
+        // weights live under `model.language_model.*`.
+        let model = TextModel::new(&config, vb.pp("model").pp("language_model"))?;
         ModelKind::TextOnly(model)
     };
 
@@ -320,6 +328,11 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    pipeline.run(&args.prompt, args.sample_len)?;
+    let prompt = if args.raw_prompt {
+        args.prompt.clone()
+    } else {
+        format!("<|turn>user\n{}<turn|>\n<|turn>model\n", args.prompt)
+    };
+    pipeline.run(&prompt, args.sample_len)?;
     Ok(())
 }

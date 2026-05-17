@@ -46,6 +46,18 @@ fn default_global_head_dim() -> usize {
 fn default_use_flash_attn() -> bool {
     false
 }
+fn default_hidden_size_per_layer_input() -> usize {
+    256
+}
+fn default_vocab_size_per_layer_input() -> usize {
+    262144
+}
+fn default_num_kv_shared_layers() -> usize {
+    0
+}
+fn default_use_double_wide_mlp() -> bool {
+    false
+}
 
 // ── Rope parameters ─────────────────────────────────────────────────────────
 
@@ -109,6 +121,14 @@ pub struct Gemma4TextConfig {
     pub use_bidirectional_attention: Option<String>,
     #[serde(default = "default_use_flash_attn")]
     pub use_flash_attn: bool,
+    #[serde(default = "default_hidden_size_per_layer_input")]
+    pub hidden_size_per_layer_input: usize,
+    #[serde(default = "default_vocab_size_per_layer_input")]
+    pub vocab_size_per_layer_input: usize,
+    #[serde(default = "default_num_kv_shared_layers")]
+    pub num_kv_shared_layers: usize,
+    #[serde(default = "default_use_double_wide_mlp")]
+    pub use_double_wide_mlp: bool,
 }
 
 impl Gemma4TextConfig {
@@ -141,6 +161,26 @@ impl Gemma4TextConfig {
             .get(layer_idx)
             .map(|s| s == "sliding_attention")
             .unwrap_or(false)
+    }
+
+    /// Layer index (inclusive) at and beyond which KV cache is shared from
+    /// earlier layers. Layers >= this index also get a double-wide MLP if
+    /// `use_double_wide_mlp` is enabled.
+    pub fn first_kv_shared_layer_idx(&self) -> usize {
+        self.num_hidden_layers
+            .saturating_sub(self.num_kv_shared_layers)
+    }
+
+    pub fn is_kv_shared_layer(&self, layer_idx: usize) -> bool {
+        self.num_kv_shared_layers > 0 && layer_idx >= self.first_kv_shared_layer_idx()
+    }
+
+    pub fn layer_intermediate_size(&self, layer_idx: usize) -> usize {
+        if self.use_double_wide_mlp && self.is_kv_shared_layer(layer_idx) {
+            self.intermediate_size * 2
+        } else {
+            self.intermediate_size
+        }
     }
 }
 
