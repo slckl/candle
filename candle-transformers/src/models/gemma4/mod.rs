@@ -77,7 +77,7 @@ impl Model {
 
     /// Forward with multimodal inputs.
     ///
-    /// `pixel_values`: optional batch of images, each `(1, C, H, W)`.
+    /// `pixel_values`: optional batch of images, each `(1, C, H, W)` in [0, 1].
     /// `audio_mel`: optional `(batch, time, mel_bins)` mel spectrogram.
     /// `audio_mel_mask`: optional `(batch, time)` mask (1.0 = padding).
     #[allow(clippy::too_many_arguments)]
@@ -89,30 +89,18 @@ impl Model {
         audio_mel_mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let (b_size, seq_len) = input_ids.dims2()?;
         let mut input_embeds = self.language_model.embed_tokens(input_ids)?;
 
         // ── Vision embedding injection ──────────────────────────────────
         if let Some(pixel_values) = pixel_values {
-            let image_mask = input_ids
-                .to_dtype(DType::F32)?
-                .eq(self.cfg.image_token_id as f64)?;
-
             let vision_features = self.vision_tower.forward(pixel_values)?;
             let image_embeds = self
                 .embed_vision
                 .forward(&vision_features)?
-                .to_dtype(input_embeds.dtype())?;
-
-            // Replace image token positions with vision embeddings
-            let image_embeds_flat = image_embeds.squeeze(0)?;
-            let mask_expanded = image_mask
-                .unsqueeze(D::Minus1)?
-                .broadcast_as(input_embeds.shape())?
-                .to_dtype(input_embeds.dtype())?;
-            let image_embeds_broadcast = broadcast_embed_to_mask(&image_embeds_flat, &image_mask)?;
-            input_embeds = ((mask_expanded.clone() * image_embeds_broadcast)?
-                + ((1.0 - mask_expanded)? * input_embeds)?)?;
+                .to_dtype(input_embeds.dtype())?
+                .squeeze(0)?;
+            input_embeds =
+                scatter_at_mask(&input_embeds, input_ids, self.cfg.image_token_id, &image_embeds)?;
         }
 
         // ── Audio embedding injection ───────────────────────────────────
@@ -127,10 +115,6 @@ impl Model {
             &self.audio_tower,
             &self.embed_audio,
         ) {
-            let audio_mask = input_ids
-                .to_dtype(DType::F32)?
-                .eq(self.cfg.audio_token_id as f64)?;
-
             let (audio_features, enc_mask) = audio_tower.forward(audio_mel, audio_mel_mask)?;
             // Filter valid frames: where enc_mask == 0
             let valid = enc_mask.eq(0.0)?;
@@ -138,13 +122,11 @@ impl Model {
             let mut all_feats = Vec::new();
             for b in 0..batch {
                 let valid_b = valid.get(b)?;
-                // Count valid frames
                 let valid_sum = valid_b
                     .to_dtype(DType::F32)?
                     .sum_all()?
                     .to_scalar::<f32>()? as usize;
                 if valid_sum > 0 {
-                    // Take the first valid_sum frames (they are contiguous after masking)
                     all_feats.push(audio_features.get(b)?.narrow(0, 0, valid_sum)?);
                 }
             }
@@ -152,21 +134,17 @@ impl Model {
                 let audio_feats = Tensor::cat(&all_feats, 0)?.unsqueeze(0)?;
                 let audio_embeds = embed_audio
                     .forward(&audio_feats)?
-                    .to_dtype(input_embeds.dtype())?;
-
-                let audio_embeds_flat = audio_embeds.squeeze(0)?;
-                let mask_expanded = audio_mask
-                    .unsqueeze(D::Minus1)?
-                    .broadcast_as(input_embeds.shape())?
-                    .to_dtype(input_embeds.dtype())?;
-                let audio_embeds_broadcast =
-                    broadcast_embed_to_mask(&audio_embeds_flat, &audio_mask)?;
-                input_embeds = ((mask_expanded.clone() * audio_embeds_broadcast)?
-                    + ((1.0 - mask_expanded)? * input_embeds)?)?;
+                    .to_dtype(input_embeds.dtype())?
+                    .squeeze(0)?;
+                input_embeds = scatter_at_mask(
+                    &input_embeds,
+                    input_ids,
+                    self.cfg.audio_token_id,
+                    &audio_embeds,
+                )?;
             }
         }
 
-        let _ = (b_size, seq_len);
         self.language_model
             .forward_embeds(input_ids, &input_embeds, seqlen_offset)
     }
@@ -176,40 +154,43 @@ impl Model {
     }
 }
 
-/// Broadcast encoder embeddings (num_tokens, hidden) into positions marked by
-/// a boolean mask (batch, seq_len), producing (batch, seq_len, hidden).
-/// Token embeddings are placed sequentially where the mask is true.
-fn broadcast_embed_to_mask(embeds: &Tensor, mask: &Tensor) -> Result<Tensor> {
-    let (b_sz, seq_len) = mask.dims2()?;
-    let hidden = embeds.dim(D::Minus1)?;
-
-    // Count masked positions per batch, fill them in sequence from embeds
-    let mask_f32 = mask.to_dtype(DType::F32)?;
-    // cumsum along seq dimension to assign embed indices
-    // Since candle doesn't have cumsum, we use a broadcast approach:
-    // Create output tensor of zeros, then use where_cond
-    let zeros = Tensor::zeros((b_sz, seq_len, hidden), embeds.dtype(), embeds.device())?;
-
-    // For single-batch simple case, just expand embeds to the output shape
-    // and let the caller do the masking.
-    if b_sz == 1 {
-        let num_tokens = mask_f32.sum_all()?.to_scalar::<f32>()? as usize;
-        if num_tokens == 0 {
-            return Ok(zeros);
-        }
-        // Pad or truncate embeds to seq_len
-        let embed_len = embeds.dim(0)?;
-        if embed_len >= seq_len {
-            return embeds.narrow(0, 0, seq_len)?.unsqueeze(0);
-        }
-        let padding = Tensor::zeros(
-            (seq_len - embed_len, hidden),
-            embeds.dtype(),
-            embeds.device(),
-        )?;
-        let padded = Tensor::cat(&[embeds, &padding], 0)?;
-        return padded.unsqueeze(0);
+/// Replace `input_embeds` at every position where `input_ids == placeholder_id`
+/// with the next row of `embeds`, in order. Returns the same shape as
+/// `input_embeds` (`B, L, H`). Assumes batch size 1.
+///
+/// Implemented as a single masked `index_select` so it stays on-device: a
+/// cumulative sum of the boolean mask gives each masked position its rank,
+/// which is used as an `index_select` index into the modality embeddings.
+fn scatter_at_mask(
+    input_embeds: &Tensor,
+    input_ids: &Tensor,
+    placeholder_id: usize,
+    embeds: &Tensor,
+) -> Result<Tensor> {
+    let (b_sz, seq_len) = input_ids.dims2()?;
+    if b_sz != 1 {
+        candle::bail!("gemma4 multimodal scatter only supports batch size 1");
     }
+    let dtype = input_embeds.dtype();
+    let device = input_embeds.device();
 
-    Ok(zeros)
+    // (1, L) boolean mask -> (L,) float.
+    let mask = input_ids
+        .to_dtype(DType::F32)?
+        .eq(placeholder_id as f64)?
+        .to_dtype(DType::F32)?
+        .squeeze(0)?;
+    // For position i with mask=1, the embedding row to pull is
+    // `cumsum(mask)[i] - 1` (count of mask=1 strictly before i). For mask=0
+    // positions we just clamp the index to a valid value; the result is
+    // discarded by the mask multiplication below.
+    let cum = mask.cumsum(0)?;
+    let m = embeds.dim(0)? as f64;
+    let idx = (cum - 1.0)?.clamp(0f64, m - 1.0)?.to_dtype(DType::U32)?;
+    let gathered = embeds.index_select(&idx, 0)?.unsqueeze(0)?;
+
+    let mask_3d = mask.unsqueeze(0)?.unsqueeze(D::Minus1)?.to_dtype(dtype)?;
+    let one = Tensor::ones((1, seq_len, 1), dtype, device)?;
+    let inv_mask = (&one - &mask_3d)?;
+    mask_3d.broadcast_mul(&gathered)? + inv_mask.broadcast_mul(input_embeds)?
 }

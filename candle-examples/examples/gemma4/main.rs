@@ -73,7 +73,12 @@ impl TextGeneration {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
+    fn run(
+        &mut self,
+        prompt: &str,
+        sample_len: usize,
+        pixel_values: Option<Vec<Tensor>>,
+    ) -> Result<()> {
         use std::io::Write;
         self.tokenizer.clear();
         let mut tokens = self
@@ -102,9 +107,24 @@ impl TextGeneration {
             let start_pos = tokens.len().saturating_sub(context_size);
             let ctxt = &tokens[start_pos..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+            // Vision/audio features are only injected on the prefill step
+            // (`index == 0`); subsequent decode steps go through the plain
+            // text path so the model just keeps generating from KV cache.
             let logits = match &mut self.model {
                 ModelKind::TextOnly(m) => m.forward(&input, start_pos)?,
-                ModelKind::Multimodal(m) => m.forward(&input, start_pos)?,
+                ModelKind::Multimodal(m) => {
+                    if index == 0 && pixel_values.is_some() {
+                        m.forward_multimodal(
+                            &input,
+                            pixel_values.as_deref(),
+                            None,
+                            None,
+                            start_pos,
+                        )?
+                    } else {
+                        m.forward(&input, start_pos)?
+                    }
+                }
             };
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let logits = if self.repeat_penalty == 1. {
@@ -198,6 +218,25 @@ struct Args {
     #[arg(long)]
     multimodal: bool,
 
+    /// Image file(s) to feed into the model. Each path is loaded, resized
+    /// preserving aspect ratio under `--max-soft-tokens`, and inserted ahead
+    /// of the user message in the prompt. Implies `--multimodal`. Repeat the
+    /// flag to pass several images.
+    #[arg(long = "image", value_name = "PATH")]
+    images: Vec<String>,
+
+    /// Maximum number of soft image tokens per image. The image is resized
+    /// (aspect-ratio preserving) so the resulting patch grid produces at most
+    /// this many soft tokens. Matches the gemma-4 image processor's
+    /// `max_soft_tokens` (default 256, model cap 280).
+    #[arg(long, default_value_t = 256)]
+    max_soft_tokens: usize,
+
+    /// Force a square resize to this edge length (in pixels, a multiple of 48)
+    /// instead of the aspect-ratio-preserving resize. Useful for debugging.
+    #[arg(long)]
+    square_image_size: Option<usize>,
+
     /// Pass the prompt through verbatim instead of wrapping it in the gemma4
     /// instruction-tuned chat template.
     #[arg(long)]
@@ -214,6 +253,32 @@ struct Args {
     /// Use the slower dmmv cuda kernel.
     #[arg(long)]
     force_dmmv: bool,
+}
+
+/// Aspect-ratio-preserving target size for the gemma-4 image processor.
+/// Returns `(height, width)` such that `(height / patch_size) * (width / patch_size)
+/// / pooling_kernel_size^2 <= max_soft_tokens` and both dims are multiples of
+/// `patch_size * pooling_kernel_size = 48`.
+fn aspect_preserving_size(height: usize, width: usize, max_soft_tokens: usize) -> (usize, usize) {
+    const PATCH_SIZE: f64 = 16.0;
+    const POOLING: f64 = 3.0;
+    const SIDE_MULT: f64 = PATCH_SIZE * POOLING; // 48
+
+    let target_patches = (max_soft_tokens as f64) * POOLING * POOLING;
+    let target_px = target_patches * PATCH_SIZE * PATCH_SIZE;
+    let total_px = (height * width) as f64;
+    let factor = (target_px / total_px).sqrt();
+
+    let mut th = ((height as f64 * factor) / SIDE_MULT).floor() as usize * SIDE_MULT as usize;
+    let mut tw = ((width as f64 * factor) / SIDE_MULT).floor() as usize * SIDE_MULT as usize;
+    // Ensure at least one patch in each dim so the model has something to look at.
+    if th == 0 {
+        th = SIDE_MULT as usize;
+    }
+    if tw == 0 {
+        tw = SIDE_MULT as usize;
+    }
+    (th, tw)
 }
 
 fn main() -> Result<()> {
@@ -284,14 +349,21 @@ fn main() -> Result<()> {
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
 
-    let model = if args.multimodal {
-        let config: Gemma4Config = match args.config_file {
+    // `--image` implies multimodal: we need the vision tower.
+    let multimodal = args.multimodal || !args.images.is_empty();
+    let model = if multimodal {
+        let mut config: Gemma4Config = match args.config_file {
             Some(config_file) => serde_json::from_slice(&std::fs::read(config_file)?)?,
             None => {
                 let config_file = repo.get("config.json")?;
                 serde_json::from_slice(&std::fs::read(config_file)?)?
             }
         };
+        // The audio tower path in this crate doesn't yet handle the
+        // `Gemma4ClippableLinear` weight layout used in the released
+        // checkpoints, so skip loading it. Vision-only / text-only is enough
+        // for now and saves a substantial chunk of memory.
+        config.audio_config = None;
         let model = Model::new(&config, vb)?;
         ModelKind::Multimodal(model)
     } else {
@@ -328,11 +400,69 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
+    // Constants from the gemma-4 vision config / image processor.
+    const PATCH_SIZE: usize = 16;
+    const POOLING_KERNEL_SIZE: usize = 3;
+    const SIDE_MULT: usize = PATCH_SIZE * POOLING_KERNEL_SIZE; // 48
+
+    let (image_block, pixel_values) = if args.images.is_empty() {
+        (String::new(), None)
+    } else {
+        if let Some(sz) = args.square_image_size {
+            if sz % SIDE_MULT != 0 || sz == 0 {
+                anyhow::bail!(
+                    "--square-image-size ({sz}) must be a positive multiple of {SIDE_MULT}",
+                );
+            }
+        }
+        let mut tensors = Vec::with_capacity(args.images.len());
+        let mut blocks = String::new();
+        for path in &args.images {
+            // Decode at full resolution to learn aspect ratio, then compute the
+            // resize target that fits within the soft-token budget.
+            let img = image::ImageReader::open(path)?
+                .decode()
+                .map_err(candle::Error::wrap)?;
+            let (orig_h, orig_w) = (img.height() as usize, img.width() as usize);
+            let (target_h, target_w) = match args.square_image_size {
+                Some(sz) => (sz, sz),
+                None => aspect_preserving_size(orig_h, orig_w, args.max_soft_tokens),
+            };
+            let patches_per_image = (target_h / PATCH_SIZE) * (target_w / PATCH_SIZE);
+            let num_soft_tokens = patches_per_image / (POOLING_KERNEL_SIZE * POOLING_KERNEL_SIZE);
+
+            blocks.push_str("<|image>");
+            for _ in 0..num_soft_tokens {
+                blocks.push_str("<|image|>");
+            }
+            blocks.push_str("<image|>");
+
+            let resized = img.resize_exact(
+                target_w as u32,
+                target_h as u32,
+                image::imageops::FilterType::Triangle,
+            );
+            let rgb = resized.to_rgb8();
+            let data = rgb.into_raw();
+            let chw = Tensor::from_vec(data, (target_h, target_w, 3), &Device::Cpu)?
+                .permute((2, 0, 1))?
+                .to_device(&device)?;
+            // Rescale to [0, 1]; the gemma-4 image processor uses identity
+            // mean/std so no further normalization is applied.
+            let img = (chw.to_dtype(dtype)? / 255.0)?.unsqueeze(0)?;
+            tensors.push(img);
+        }
+        (blocks, Some(tensors))
+    };
+
     let prompt = if args.raw_prompt {
         args.prompt.clone()
     } else {
-        format!("<|turn>user\n{}<turn|>\n<|turn>model\n", args.prompt)
+        format!(
+            "<|turn>user\n{image_block}{}<turn|>\n<|turn>model\n",
+            args.prompt
+        )
     };
-    pipeline.run(&prompt, args.sample_len)?;
+    pipeline.run(&prompt, args.sample_len, pixel_values)?;
     Ok(())
 }
